@@ -41,6 +41,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <paths.h>
+#include <sys/wait.h>
 
 class StderrInhibitor
 {
@@ -93,8 +94,44 @@ void operator delete[](void *ptr, size_t sz) {
 }
 
 #elif defined _WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #define _STDINT // ~.~
 #include "client/windows/handler/exception_handler.h"
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+
+class StderrInhibitor
+{
+	int saved_stderr = -1;
+	int null_fd = -1;
+
+public:
+	StderrInhibitor() {
+		saved_stderr = _dup(_fileno(stderr));
+		null_fd = _open("NUL", _O_WRONLY);
+		if (saved_stderr != -1 && null_fd != -1) {
+			_dup2(null_fd, _fileno(stderr));
+		}
+	}
+
+	~StderrInhibitor() {
+		fflush(stderr);
+		if (saved_stderr != -1) {
+			_dup2(saved_stderr, _fileno(stderr));
+			_close(saved_stderr);
+		}
+		if (null_fd != -1) {
+			_close(null_fd);
+		}
+	}
+};
 
 #else
 #error Bad platform.
@@ -105,11 +142,38 @@ void operator delete[](void *ptr, size_t sz) {
 #include <google_breakpad/processor/process_state.h>
 #include <google_breakpad/processor/call_stack.h>
 #include <google_breakpad/processor/stack_frame.h>
+#include <google_breakpad/processor/stack_frame_cpu.h>
+#include <google_breakpad/processor/basic_source_line_resolver.h>
 #include <processor/pathname_stripper.h>
+#include <processor/simple_symbol_supplier.h>
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <sstream>
 #include <streambuf>
+#include <fstream>
 #include <memory>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <iomanip>
+#include <map>
+#include <mutex>
+#include <cstdarg>
+#include <ctime>
+#include <filesystem>
+#include <limits>
+#include <optional>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
 
 Accelerator g_accelerator;
 SMEXT_LINK(&g_accelerator);
@@ -138,6 +202,2618 @@ char dumpStoragePath[512];
 char logPath[512];
 
 google_breakpad::ExceptionHandler *handler = NULL;
+static std::mutex acceleratorLogMutex;
+static std::atomic<bool> acceleratorDebugLoggingEnabled{false};
+static std::atomic<bool> acceleratorBackgroundThreadsStarted{false};
+
+std::string ToLowerCopy(const std::string &value)
+{
+	std::string lowered(value);
+	std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return lowered;
+}
+
+static bool IsTruthyCoreConfigValue(const char *key, bool defaultValue)
+{
+	const char *raw = g_pSM->GetCoreConfigValue(key);
+	if (!raw || !raw[0]) {
+		return defaultValue;
+	}
+
+	std::string lowered = ToLowerCopy(raw);
+	if (lowered == "1" || lowered == "y" || lowered == "yes" || lowered == "true" || lowered == "on") {
+		return true;
+	}
+	if (lowered == "0" || lowered == "n" || lowered == "no" || lowered == "false" || lowered == "off") {
+		return false;
+	}
+	return defaultValue;
+}
+
+static std::string RedactUrlForLog(const char *url)
+{
+	if (!url || !url[0]) {
+		return "(not configured)";
+	}
+
+	std::string safeUrl(url);
+	size_t query = safeUrl.find('?');
+	if (query != std::string::npos) {
+		safeUrl.erase(query);
+		safeUrl += "?...";
+	}
+
+	return safeUrl;
+}
+
+static std::tm GetLocalLogTimestamp(std::time_t rawTime)
+{
+	std::tm localTime{};
+#if defined _WINDOWS
+	localtime_s(&localTime, &rawTime);
+#else
+	localtime_r(&rawTime, &localTime);
+#endif
+	return localTime;
+}
+
+static void AcceleratorWriteLogLine(const char *message)
+{
+	std::lock_guard<std::mutex> lock(acceleratorLogMutex);
+	FILE *log = fopen(logPath, "a");
+	if (!log) {
+		return;
+	}
+
+	auto now = std::chrono::system_clock::now();
+	auto rawTime = std::chrono::system_clock::to_time_t(now);
+	std::tm localTime = GetLocalLogTimestamp(rawTime);
+	char timestamp[32];
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &localTime);
+
+	fprintf(log, "[%s] %s\n", timestamp, message);
+	fflush(log);
+	fclose(log);
+}
+
+static void AcceleratorLogMessageV(bool toConsole, bool debugOnly, const char *fmt, va_list ap)
+{
+	char message[1024];
+	vsnprintf(message, sizeof(message), fmt, ap);
+	message[sizeof(message) - 1] = '\0';
+
+	if (debugOnly && !acceleratorDebugLoggingEnabled.load(std::memory_order_relaxed)) {
+		return;
+	}
+
+	if (toConsole) {
+		fprintf(stderr, "[Accelerator] %s\n", message);
+		fflush(stderr);
+	}
+
+	AcceleratorWriteLogLine(message);
+}
+
+static void AcceleratorConsoleMessageV(const char *fmt, va_list ap)
+{
+	char message[1024];
+	vsnprintf(message, sizeof(message), fmt, ap);
+	message[sizeof(message) - 1] = '\0';
+
+	fprintf(stderr, "[Accelerator] %s\n", message);
+	fflush(stderr);
+}
+
+static void AcceleratorConsoleMessage(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	AcceleratorConsoleMessageV(fmt, ap);
+	va_end(ap);
+}
+
+static void AcceleratorConsoleWarning(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	AcceleratorLogMessageV(true, false, fmt, ap);
+	va_end(ap);
+}
+
+static void AcceleratorDebugLog(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	AcceleratorLogMessageV(false, true, fmt, ap);
+	va_end(ap);
+}
+
+namespace
+{
+	using nlohmann::json;
+	using google_breakpad::BasicSourceLineResolver;
+	using google_breakpad::CallStack;
+	using google_breakpad::MemoryRegion;
+	using google_breakpad::Minidump;
+	using google_breakpad::MinidumpMemoryList;
+	using google_breakpad::MinidumpMemoryRegion;
+	using google_breakpad::MinidumpProcessor;
+	using google_breakpad::PathnameStripper;
+	using google_breakpad::ProcessResult;
+	using google_breakpad::ProcessState;
+	using google_breakpad::SimpleSymbolSupplier;
+	using google_breakpad::StackFrame;
+	using google_breakpad::StackFrameAMD64;
+	using google_breakpad::StackFrameX86;
+
+	struct PendingDumpEntry
+	{
+		std::string name;
+		std::string dumpPath;
+		std::string metadataPath;
+		bool hasMetadata = false;
+	};
+
+	struct LoadedDump
+	{
+		Minidump minidump;
+		ProcessState processState;
+
+		explicit LoadedDump(const std::string &path)
+			: minidump(path)
+		{
+		}
+	};
+
+	size_t HexWidthForAddress(uint64_t value);
+	std::string CollectHexDump(uint64_t base, const std::vector<uint8_t> &memory, const std::string &indent);
+	const char *FrameTrustName(StackFrame::FrameTrust trust);
+
+	enum class AcceleratorMode
+	{
+		Site,
+		Local,
+	};
+
+	enum class LocalDumpJobState
+	{
+		Queued,
+		Running,
+		Done,
+		Failed,
+	};
+
+	struct LocalDumpSettings
+	{
+		std::string gamePath;
+		std::string sourceModPath;
+		std::string carburetorPath;
+		std::vector<std::string> symbolPaths;
+		std::string localSymbolStoreRoot;
+		std::string localOutputRoot;
+#if defined _WINDOWS
+		std::string dumpSymsPath;
+#endif
+	};
+
+	struct LocalDumpJob
+	{
+		int id = 0;
+		bool stackOnly = false;
+		std::string dumpName;
+		std::string mode;
+		std::string requestedOutputPath;
+		PendingDumpEntry entry;
+		LocalDumpSettings settings;
+		LocalDumpJobState state = LocalDumpJobState::Queued;
+		std::string status;
+		std::string outputPath;
+		std::string result;
+		std::string error;
+		std::chrono::system_clock::time_point createdAt;
+		std::chrono::system_clock::time_point finishedAt;
+	};
+
+	bool HasSuffix(const std::string &value, const char *suffix)
+	{
+		size_t suffixLength = strlen(suffix);
+		return value.size() >= suffixLength && value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
+	}
+
+	bool ShouldDeleteProcessedDump()
+	{
+		return IsTruthyCoreConfigValue("MinidumpDeleteAfterProcessing", true);
+	}
+
+	AcceleratorMode GetAcceleratorMode()
+	{
+		const char *raw = g_pSM->GetCoreConfigValue("MinidumpMode");
+		if (!raw || !raw[0]) {
+			return AcceleratorMode::Site;
+		}
+
+		std::string lowered = ToLowerCopy(raw);
+		if (lowered == "local") {
+			return AcceleratorMode::Local;
+		}
+		return AcceleratorMode::Site;
+	}
+
+	bool IsLocalMode()
+	{
+		return GetAcceleratorMode() == AcceleratorMode::Local;
+	}
+
+	bool CollectPendingDumps(std::vector<PendingDumpEntry> &entries, std::string *error = nullptr)
+	{
+		entries.clear();
+
+		IDirectory *dumps = libsys->OpenDirectory(dumpStoragePath);
+		if (!dumps) {
+			if (error) {
+				*error = "Failed to open dump directory";
+			}
+			return false;
+		}
+
+		while (dumps->MoreFiles()) {
+			if (!dumps->IsEntryFile()) {
+				dumps->NextEntry();
+				continue;
+			}
+
+			const char *entryName = dumps->GetEntryName();
+			std::string fileName(entryName ? entryName : "");
+			if (!HasSuffix(fileName, ".dmp")) {
+				dumps->NextEntry();
+				continue;
+			}
+
+			PendingDumpEntry entry;
+			entry.name = fileName.substr(0, fileName.size() - 4);
+			entry.dumpPath = std::string(dumpStoragePath) + "/" + fileName;
+			entry.metadataPath = entry.dumpPath + ".txt";
+			entry.hasMetadata = libsys->PathExists(entry.metadataPath.c_str());
+			entries.push_back(entry);
+			dumps->NextEntry();
+		}
+
+		libsys->CloseDirectory(dumps);
+		std::sort(entries.begin(), entries.end(), [](const PendingDumpEntry &left, const PendingDumpEntry &right) {
+			return left.name < right.name;
+		});
+		return true;
+	}
+
+	bool FindPendingDumpByName(const std::string &name, PendingDumpEntry &result, std::string *error = nullptr)
+	{
+		std::vector<PendingDumpEntry> entries;
+		if (!CollectPendingDumps(entries, error)) {
+			return false;
+		}
+
+		for (const PendingDumpEntry &entry : entries) {
+			if (entry.name == name) {
+				result = entry;
+				return true;
+			}
+		}
+
+		if (error) {
+			*error = "Dump not found";
+		}
+		return false;
+	}
+
+	std::string ReadWholeFile(const std::string &path)
+	{
+		std::ifstream input(path, std::ios::in | std::ios::binary);
+		if (!input) {
+			return "";
+		}
+
+		std::ostringstream buffer;
+		buffer << input.rdbuf();
+		return buffer.str();
+	}
+
+	bool WriteWholeFile(const std::string &path, const std::string &contents, std::string *error)
+	{
+		std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::trunc);
+		if (!output) {
+			if (error) {
+				*error = "Failed to open output file for writing";
+			}
+			return false;
+		}
+
+		output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+		if (!output.good()) {
+			if (error) {
+				*error = "Failed while writing the output file";
+			}
+			return false;
+		}
+
+		return true;
+	}
+
+	bool IsAbsolutePath(const std::string &path)
+	{
+		if (path.size() >= 1 && (path[0] == '/' || path[0] == '\\')) {
+			return true;
+		}
+		return path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':' &&
+			(path[2] == '/' || path[2] == '\\');
+	}
+
+	std::string TrimCopy(const std::string &value)
+	{
+		size_t start = 0;
+		while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+			start++;
+		}
+
+		size_t end = value.size();
+		while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+			end--;
+		}
+
+		return value.substr(start, end - start);
+	}
+
+	std::vector<std::string> SplitConfigPaths(const char *raw)
+	{
+		std::vector<std::string> paths;
+		if (!raw || !raw[0]) {
+			return paths;
+		}
+
+		std::string current;
+		for (const char *cursor = raw; ; ++cursor) {
+			char ch = *cursor;
+			if (ch == '\0' || ch == ';' || ch == ',' || ch == '\n' || ch == '\r') {
+				std::string trimmed = TrimCopy(current);
+				if (!trimmed.empty()) {
+					paths.push_back(trimmed);
+				}
+				current.clear();
+				if (ch == '\0') {
+					break;
+				}
+				continue;
+			}
+			current.push_back(ch);
+		}
+
+		return paths;
+	}
+
+	std::string JoinStrings(const std::vector<std::string> &items, const char *separator)
+	{
+		std::ostringstream out;
+		for (size_t i = 0; i < items.size(); ++i) {
+			if (i != 0) {
+				out << separator;
+			}
+			out << items[i];
+		}
+		return out.str();
+	}
+
+	std::string StripLeadingNonJson(const std::string &raw);
+
+	std::string EscapeJson(const std::string &input)
+	{
+		std::ostringstream out;
+		for (unsigned char ch : input) {
+			switch (ch) {
+				case '\\': out << "\\\\"; break;
+				case '"': out << "\\\""; break;
+				case '\b': out << "\\b"; break;
+				case '\f': out << "\\f"; break;
+				case '\n': out << "\\n"; break;
+				case '\r': out << "\\r"; break;
+				case '\t': out << "\\t"; break;
+				default:
+					if (ch < 0x20) {
+						out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(ch) << std::dec << std::setfill(' ');
+					} else {
+						out << static_cast<char>(ch);
+					}
+			}
+		}
+		return out.str();
+	}
+
+	std::string QuoteCommandArg(const std::string &value)
+	{
+#if defined _WINDOWS
+		std::string normalized = value;
+		std::replace(normalized.begin(), normalized.end(), '/', '\\');
+#else
+		const std::string &normalized = value;
+#endif
+
+		std::string escaped;
+		escaped.reserve(normalized.size() + 2);
+		escaped.push_back('"');
+		for (char ch : normalized) {
+			if (ch == '"') {
+				escaped += "\\\"";
+			} else {
+				escaped.push_back(ch);
+			}
+		}
+		escaped.push_back('"');
+		return escaped;
+	}
+
+#if defined _WINDOWS
+	std::wstring Utf8ToWide(const std::string &value)
+	{
+		if (value.empty()) {
+			return std::wstring();
+		}
+
+		int required = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+		if (required <= 0) {
+			return std::wstring();
+		}
+
+		std::vector<wchar_t> buffer(static_cast<size_t>(required), L'\0');
+		if (MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, buffer.data(), required) <= 0) {
+			return std::wstring();
+		}
+
+		return std::wstring(buffer.data());
+	}
+
+	std::string WideToUtf8(const std::wstring &value)
+	{
+		if (value.empty()) {
+			return std::string();
+		}
+
+		int required = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		if (required <= 0) {
+			return std::string();
+		}
+
+		std::vector<char> buffer(static_cast<size_t>(required), '\0');
+		if (WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, buffer.data(), required, nullptr, nullptr) <= 0) {
+			return std::string();
+		}
+
+		return std::string(buffer.data());
+	}
+
+	std::wstring GetDirectoryName(const std::wstring &path)
+	{
+		size_t slash = path.find_last_of(L"\\/");
+		if (slash == std::wstring::npos) {
+			return std::wstring();
+		}
+
+		return path.substr(0, slash);
+	}
+
+	std::wstring BuildWindowsCommandLine(const std::vector<std::string> &arguments)
+	{
+		std::ostringstream out;
+		for (size_t i = 0; i < arguments.size(); ++i) {
+			if (i != 0) {
+				out << ' ';
+			}
+			out << QuoteCommandArg(arguments[i]);
+		}
+		return Utf8ToWide(out.str());
+	}
+
+#endif
+
+	bool PathExistsFile(const std::string &path)
+	{
+		std::error_code ec;
+		return std::filesystem::exists(std::filesystem::u8path(path), ec);
+	}
+
+	std::string NormalizePathString(const std::filesystem::path &path)
+	{
+		return path.lexically_normal().make_preferred().u8string();
+	}
+
+	bool StartsWithPathPrefix(const std::string &path, const char *prefix)
+	{
+		const size_t prefixLength = strlen(prefix);
+		if (path.size() < prefixLength) {
+			return false;
+		}
+		for (size_t i = 0; i < prefixLength; ++i) {
+			char left = static_cast<char>(std::tolower(static_cast<unsigned char>(path[i])));
+			char right = static_cast<char>(std::tolower(static_cast<unsigned char>(prefix[i])));
+			if (left != right) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	std::string ResolveSourceModRelativePath(const std::string &configured,
+		const std::string &sourceModRoot,
+		const std::string &gameRoot)
+	{
+		if (configured.empty()) {
+			return "";
+		}
+		if (IsAbsolutePath(configured)) {
+			return NormalizePathString(std::filesystem::u8path(configured));
+		}
+
+		std::string normalized = configured;
+		std::replace(normalized.begin(), normalized.end(), '\\', '/');
+		if (StartsWithPathPrefix(normalized, "addons/sourcemod/")) {
+			return NormalizePathString(std::filesystem::u8path(gameRoot) / std::filesystem::u8path(normalized));
+		}
+		if (ToLowerCopy(normalized) == "addons/sourcemod") {
+			return NormalizePathString(std::filesystem::u8path(gameRoot) / "addons" / "sourcemod");
+		}
+		return NormalizePathString(std::filesystem::u8path(sourceModRoot) / std::filesystem::u8path(normalized));
+	}
+
+	std::string GetDefaultCarburetorPath(const std::string &sourceModRoot)
+	{
+#if defined _WINDOWS
+		return NormalizePathString(std::filesystem::u8path(sourceModRoot) / "bin" / (std::string(PLATFORM_ARCH_FOLDER) + "carburetor.exe"));
+#else
+		return NormalizePathString(std::filesystem::u8path(sourceModRoot) / "bin" / (std::string(PLATFORM_ARCH_FOLDER) + "carburetor"));
+#endif
+	}
+
+	std::string GetConfiguredCarburetorPath()
+	{
+		const char *configured = g_pSM->GetCoreConfigValue("MinidumpLocalCarburetorPath");
+		if (configured && configured[0]) {
+			return ResolveSourceModRelativePath(configured, crashSourceModPath, crashGamePath);
+		}
+		return GetDefaultCarburetorPath(crashSourceModPath);
+	}
+
+	std::string GetLocalSymbolStoreRoot()
+	{
+		return NormalizePathString(std::filesystem::u8path(crashSourceModPath) / "data" / "dumps" / "symbols");
+	}
+
+	std::string GetLocalOutputRoot()
+	{
+		return NormalizePathString(std::filesystem::u8path(crashSourceModPath) / "data" / "dumps" / "outputs");
+	}
+
+	std::vector<std::string> GetConfiguredLocalSymbolPaths()
+	{
+		std::vector<std::string> results;
+		auto appendIfUniqueExisting = [&](const std::string &path) {
+			if (path.empty() || !PathExistsFile(path)) {
+				return;
+			}
+			if (std::find(results.begin(), results.end(), path) == results.end()) {
+				results.push_back(path);
+			}
+		};
+
+		for (const std::string &item : SplitConfigPaths(g_pSM->GetCoreConfigValue("MinidumpLocalSymbolPath"))) {
+			appendIfUniqueExisting(ResolveSourceModRelativePath(item, crashSourceModPath, crashGamePath));
+		}
+
+		appendIfUniqueExisting(GetLocalSymbolStoreRoot());
+
+		return results;
+	}
+
+	bool EnsureDirectoryExists(const std::string &path, std::string &error)
+	{
+		try {
+			std::filesystem::create_directories(path);
+			return true;
+		} catch (const std::exception &ex) {
+			error = ex.what();
+			return false;
+		}
+	}
+
+	bool RunCommandCapture(const std::string &commandLine, std::string &output, int &exitCode, std::string &error)
+	{
+		output.clear();
+		exitCode = -1;
+
+#if defined _WINDOWS
+		std::string wrappedCommand = commandLine + " 2>&1";
+		FILE *pipe = _popen(wrappedCommand.c_str(), "r");
+#else
+		FILE *pipe = popen((commandLine + " 2>&1").c_str(), "r");
+#endif
+		if (!pipe) {
+			error = "Failed to launch external command";
+			return false;
+		}
+
+		char buffer[4096];
+		while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+			output += buffer;
+		}
+
+#if defined _WINDOWS
+		exitCode = _pclose(pipe);
+#else
+		exitCode = pclose(pipe);
+		if (WIFEXITED(exitCode)) {
+			exitCode = WEXITSTATUS(exitCode);
+		}
+#endif
+
+		return true;
+	}
+
+#if defined _WINDOWS
+	bool RunProcessCapture(const std::vector<std::string> &arguments,
+		std::string &stdoutOutput,
+		std::string &stderrOutput,
+		int &exitCode,
+		std::string &error)
+	{
+		stdoutOutput.clear();
+		stderrOutput.clear();
+		exitCode = -1;
+
+		if (arguments.empty()) {
+			error = "No command arguments were provided";
+			return false;
+		}
+
+		std::wstring application = Utf8ToWide(arguments[0]);
+		if (application.empty()) {
+			error = "Failed to convert executable path to UTF-16";
+			return false;
+		}
+
+		std::wstring commandLine = BuildWindowsCommandLine(arguments);
+		if (commandLine.empty()) {
+			error = "Failed to build command line";
+			return false;
+		}
+
+		SECURITY_ATTRIBUTES securityAttributes{};
+		securityAttributes.nLength = sizeof(securityAttributes);
+		securityAttributes.bInheritHandle = TRUE;
+
+		HANDLE outputReadPipe = nullptr;
+		HANDLE outputWritePipe = nullptr;
+		if (!CreatePipe(&outputReadPipe, &outputWritePipe, &securityAttributes, 0)) {
+			error = "CreatePipe failed";
+			return false;
+		}
+
+		if (!SetHandleInformation(outputReadPipe, HANDLE_FLAG_INHERIT, 0)) {
+			CloseHandle(outputReadPipe);
+			CloseHandle(outputWritePipe);
+			error = "SetHandleInformation failed";
+			return false;
+		}
+
+		STARTUPINFOW startupInfo{};
+		startupInfo.cb = sizeof(startupInfo);
+		startupInfo.dwFlags = STARTF_USESTDHANDLES;
+		startupInfo.hStdInput = nullptr;
+		startupInfo.hStdOutput = outputWritePipe;
+		startupInfo.hStdError = outputWritePipe;
+
+		PROCESS_INFORMATION processInfo{};
+		std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+		mutableCommandLine.push_back(L'\0');
+		std::wstring workingDirectory = GetDirectoryName(application);
+
+		BOOL created = CreateProcessW(
+			application.c_str(),
+			mutableCommandLine.data(),
+			nullptr,
+			nullptr,
+			TRUE,
+			CREATE_NO_WINDOW,
+			nullptr,
+			workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
+			&startupInfo,
+			&processInfo
+		);
+
+		CloseHandle(outputWritePipe);
+
+		if (!created) {
+			DWORD lastError = GetLastError();
+			CloseHandle(outputReadPipe);
+
+			LPWSTR messageBuffer = nullptr;
+			FormatMessageW(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+				nullptr,
+				lastError,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				reinterpret_cast<LPWSTR>(&messageBuffer),
+				0,
+				nullptr
+			);
+
+			std::wstring wideError = messageBuffer ? messageBuffer : L"CreateProcessW failed";
+			if (messageBuffer) {
+				LocalFree(messageBuffer);
+			}
+
+			error = WideToUtf8(wideError);
+			return false;
+		}
+
+		char buffer[4096];
+		DWORD bytesRead = 0;
+		while (ReadFile(outputReadPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead != 0) {
+			stdoutOutput.append(buffer, buffer + bytesRead);
+		}
+		CloseHandle(outputReadPipe);
+
+		WaitForSingleObject(processInfo.hProcess, INFINITE);
+		DWORD processExitCode = 0;
+		if (GetExitCodeProcess(processInfo.hProcess, &processExitCode)) {
+			exitCode = static_cast<int>(processExitCode);
+		}
+
+		CloseHandle(processInfo.hThread);
+		CloseHandle(processInfo.hProcess);
+
+		return true;
+	}
+#endif
+
+	#if defined _WINDOWS
+	std::string GetBundledDumpSymsPath(const LocalDumpSettings &settings)
+	{
+		return settings.dumpSymsPath;
+	}
+	#endif
+
+	bool TryRunCarburetorRaw(const PendingDumpEntry &entry,
+		const LocalDumpSettings &settings,
+		std::string &output,
+		std::string &error)
+	{
+		const std::string &carburetorPath = settings.carburetorPath;
+		if (carburetorPath.empty() || !PathExistsFile(carburetorPath)) {
+			error = "Carburetor binary was not found. Configure MinidumpLocalCarburetorPath or place carburetor in addons/sourcemod/bin.";
+			return false;
+		}
+
+		const std::vector<std::string> &symbolPaths = settings.symbolPaths;
+		std::vector<std::string> arguments{carburetorPath, entry.dumpPath};
+		for (const std::string &symbolPath : symbolPaths) {
+			arguments.push_back(symbolPath);
+		}
+
+		int exitCode = -1;
+#if defined _WINDOWS
+		std::string stderrOutput;
+		if (!RunProcessCapture(arguments, output, stderrOutput, exitCode, error)) {
+			return false;
+		}
+		output = StripLeadingNonJson(output);
+		if (output.empty() && !stderrOutput.empty()) {
+			error = stderrOutput;
+			return false;
+		}
+#else
+		std::ostringstream commandLine;
+		commandLine << QuoteCommandArg(carburetorPath) << " " << QuoteCommandArg(entry.dumpPath);
+		for (const std::string &symbolPath : symbolPaths) {
+			commandLine << " " << QuoteCommandArg(symbolPath);
+		}
+		if (!RunCommandCapture(commandLine.str(), output, exitCode, error)) {
+			return false;
+		}
+#endif
+		if (exitCode != 0) {
+			std::ostringstream out;
+			out << "Carburetor exited with code " << exitCode;
+			if (!output.empty()) {
+				out << ": " << output;
+			}
+			error = out.str();
+			return false;
+		}
+
+		return true;
+	}
+
+	std::string SymbolLeafNameForModule(const std::string &debugFileName)
+	{
+		std::string lowered = ToLowerCopy(debugFileName);
+		if (lowered.size() > 4 && lowered.substr(lowered.size() - 4) == ".pdb") {
+			return debugFileName.substr(0, debugFileName.size() - 4) + ".sym";
+		}
+		return debugFileName + ".sym";
+	}
+
+#if defined _WINDOWS
+	const char *kMissingAdjacentPdb = "No adjacent PDB found";
+
+	std::string GetAdjacentPdbPath(const std::string &modulePath)
+	{
+		if (modulePath.empty()) {
+			return "";
+		}
+
+		size_t slash = modulePath.find_last_of("/\\");
+		size_t dot = modulePath.find_last_of('.');
+		if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+			return modulePath + ".pdb";
+		}
+		return modulePath.substr(0, dot) + ".pdb";
+	}
+#endif
+
+	bool LooksLikeSymbolizableModulePath(const std::string &path)
+	{
+		if (path.empty() || !IsAbsolutePath(path)) {
+			return false;
+		}
+
+		const std::string lowered = ToLowerCopy(path);
+#if defined _WINDOWS
+		if (HasSuffix(lowered, ".dll") || HasSuffix(lowered, ".exe") || HasSuffix(lowered, ".pdb")) {
+			return true;
+		}
+		return false;
+#else
+		if (lowered.find("/dev/shm/") == 0) {
+			return false;
+		}
+		if (lowered.find(".mmdb") != std::string::npos) {
+			return false;
+		}
+		if (HasSuffix(lowered, ".vpk") || HasSuffix(lowered, ".txt") || HasSuffix(lowered, ".cfg")) {
+			return false;
+		}
+		if (HasSuffix(lowered, ".so") || HasSuffix(lowered, ".srv.so") || HasSuffix(lowered, ".dll")) {
+			return true;
+		}
+		if (lowered.find("/bin/srcds_linux") != std::string::npos || HasSuffix(lowered, "/srcds_linux")) {
+			return true;
+		}
+		return false;
+#endif
+	}
+
+	bool GenerateLocalSymbolFile(const google_breakpad::CodeModule *module,
+		const LocalDumpSettings &settings,
+		std::string &storedPath,
+		std::string &error)
+	{
+		storedPath.clear();
+		if (!module) {
+			error = "Module is null";
+			return false;
+		}
+
+		std::string debugFile = module->debug_file();
+		if (debugFile.empty() || !IsAbsolutePath(debugFile)) {
+			debugFile = module->code_file();
+		}
+		if (debugFile.empty() || !IsAbsolutePath(debugFile)) {
+			error = "Module path is not absolute";
+			return false;
+		}
+		if (!LooksLikeSymbolizableModulePath(debugFile)) {
+			error = "Module is not a supported symbolizable binary";
+			return false;
+		}
+
+		std::string debugFileName = PathnameStripper::File(module->debug_file());
+		if (debugFileName.empty()) {
+			debugFileName = PathnameStripper::File(module->code_file());
+		}
+		if (debugFileName.empty()) {
+			error = "Module debug file name is empty";
+			return false;
+		}
+
+		const std::string identifier = module->debug_identifier();
+		if (identifier.empty()) {
+			error = "Module debug identifier is empty";
+			return false;
+		}
+
+		const std::string storeRoot = settings.localSymbolStoreRoot;
+		const std::string moduleDir = storeRoot + "/" + debugFileName + "/" + identifier;
+		if (!EnsureDirectoryExists(moduleDir, error)) {
+			return false;
+		}
+
+		storedPath = moduleDir + "/" + SymbolLeafNameForModule(debugFileName);
+		if (PathExistsFile(storedPath)) {
+			return true;
+		}
+
+#if defined _WINDOWS
+		const std::string moduleBinary = module->code_file();
+		if (moduleBinary.empty() || !IsAbsolutePath(moduleBinary)) {
+			error = "Module binary path is not absolute";
+			return false;
+		}
+
+		const std::string pdbPath = GetAdjacentPdbPath(moduleBinary);
+		if (pdbPath.empty() || !PathExistsFile(pdbPath)) {
+			error = kMissingAdjacentPdb;
+			return false;
+		}
+
+		const std::string dumpSymsPath = GetBundledDumpSymsPath(settings);
+		if (dumpSymsPath.empty() || !PathExistsFile(dumpSymsPath)) {
+			error = "dump_syms.exe was not found in addons/sourcemod/bin";
+			return false;
+		}
+
+		std::string outputText;
+		std::string errorText;
+		int exitCode = -1;
+		if (!RunProcessCapture({dumpSymsPath, debugFile}, outputText, errorText, exitCode, error)) {
+			return false;
+		}
+		if (exitCode != 0) {
+			std::ostringstream out;
+			out << "dump_syms.exe exited with code " << exitCode;
+			if (!errorText.empty()) {
+				out << ": " << errorText;
+			} else if (!outputText.empty()) {
+				out << ": " << outputText;
+			}
+			error = out.str();
+			return false;
+		}
+		if (outputText.empty()) {
+			error = "dump_syms.exe returned an empty symbol file";
+			return false;
+		}
+
+		std::string writeError;
+		if (!WriteWholeFile(storedPath, outputText, &writeError)) {
+			error = writeError;
+			return false;
+		}
+
+		return true;
+#else
+		auto debugFileDir = google_breakpad::DirName(debugFile);
+		std::vector<std::string> debugDirs{
+			debugFileDir,
+			debugFileDir + "/.debug",
+			"/usr/lib/debug" + debugFileDir,
+		};
+
+		std::ostringstream outputStream;
+		google_breakpad::DumpOptions options(ALL_SYMBOL_DATA, true, true, false);
+		{
+			StderrInhibitor stderrInhibitor;
+			if (!WriteSymbolFile(debugFile, debugFile, "Linux", "", debugDirs, options, outputStream)) {
+				outputStream.str("");
+				outputStream.clear();
+				if (!WriteSymbolFile(debugFile, debugFile, "Linux", "", {}, options, outputStream)) {
+					error = "WriteSymbolFile failed";
+					return false;
+				}
+			}
+		}
+
+		std::string writeError;
+		if (!WriteWholeFile(storedPath, outputStream.str(), &writeError)) {
+			error = writeError;
+			return false;
+		}
+
+		return true;
+#endif
+	}
+
+	const CallStack *GetRequestingThreadStack(const ProcessState &processState, int &threadIndex);
+
+	std::set<std::string> CollectRequestingThreadModulePaths(const LoadedDump &loadedDump)
+	{
+		std::set<std::string> modulePaths;
+		int threadIndex = 0;
+		const CallStack *stack = GetRequestingThreadStack(loadedDump.processState, threadIndex);
+		if (!stack) {
+			return modulePaths;
+		}
+
+		const auto *frames = stack->frames();
+		for (size_t i = 0; i < frames->size(); ++i) {
+			const StackFrame *frame = frames->at(i);
+			if (!frame || !frame->module) {
+				continue;
+			}
+
+			std::string path = frame->module->debug_file();
+			if (path.empty() || !IsAbsolutePath(path)) {
+				path = frame->module->code_file();
+			}
+			if (LooksLikeSymbolizableModulePath(path)) {
+				modulePaths.insert(path);
+			}
+		}
+
+		return modulePaths;
+	}
+
+	void EnsureLocalSymbolsForDump(const LoadedDump &loadedDump, const LocalDumpSettings &settings)
+	{
+		const auto *modules = loadedDump.processState.modules();
+		if (!modules) {
+			return;
+		}
+
+		std::string rootError;
+		if (!EnsureDirectoryExists(settings.localSymbolStoreRoot, rootError)) {
+			AcceleratorConsoleWarning("Failed to create local symbol store: %s", rootError.c_str());
+			return;
+		}
+
+		bool hadVerboseFailure = false;
+		std::set<std::string> requestedPaths = CollectRequestingThreadModulePaths(loadedDump);
+		for (unsigned int i = 0; i < modules->module_count(); ++i) {
+			const google_breakpad::CodeModule *module = modules->GetModuleAtIndex(i);
+			if (!module) {
+				continue;
+			}
+
+			std::string modulePath = module->debug_file();
+			if (modulePath.empty() || !IsAbsolutePath(modulePath)) {
+				modulePath = module->code_file();
+			}
+			if (!requestedPaths.empty() && requestedPaths.find(modulePath) == requestedPaths.end()) {
+				continue;
+			}
+
+			std::string storedPath;
+			std::string error;
+			if (!GenerateLocalSymbolFile(module, settings, storedPath, error)) {
+#if defined _WINDOWS
+				if (error == kMissingAdjacentPdb) {
+					continue;
+				}
+#endif
+				hadVerboseFailure = hadVerboseFailure || !error.empty();
+			}
+		}
+
+	}
+
+	bool ParseCarburetorJson(const std::string &raw, json &document, std::string &error)
+	{
+		try {
+			document = json::parse(StripLeadingNonJson(raw));
+			if (!document.is_object()) {
+				error = "Carburetor did not return a JSON object";
+				return false;
+			}
+			return true;
+		} catch (const std::exception &ex) {
+			error = ex.what();
+			return false;
+		}
+	}
+
+	int DecodeBase64Value(unsigned char ch)
+	{
+		if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+		if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+		if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+		if (ch == '+') return 62;
+		if (ch == '/') return 63;
+		return -1;
+	}
+
+	bool DecodeBase64(const std::string &input, std::vector<uint8_t> &output)
+	{
+		output.clear();
+		int val = 0;
+		int valb = -8;
+		for (unsigned char ch : input) {
+			if (std::isspace(ch)) {
+				continue;
+			}
+			if (ch == '=') {
+				break;
+			}
+			int decoded = DecodeBase64Value(ch);
+			if (decoded < 0) {
+				return false;
+			}
+			val = (val << 6) + decoded;
+			valb += 6;
+			if (valb >= 0) {
+				output.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+				valb -= 8;
+			}
+		}
+		return true;
+	}
+
+	uint64_t JsonUInt64(const json &value, uint64_t fallback = 0)
+	{
+		if (value.is_number_unsigned()) {
+			return value.get<uint64_t>();
+		}
+		if (value.is_number_integer()) {
+			return static_cast<uint64_t>(value.get<int64_t>());
+		}
+		if (value.is_string()) {
+			try {
+				return std::stoull(value.get<std::string>());
+			} catch (...) {
+				return fallback;
+			}
+		}
+		return fallback;
+	}
+
+	std::string JsonString(const json &value)
+	{
+		return value.is_string() ? value.get<std::string>() : "";
+	}
+
+	std::string RenderCarburetorInstructions(const json &instructionsValue, uint64_t ip, const std::string &indent)
+	{
+		if (!instructionsValue.is_array()) {
+			return "";
+		}
+
+		std::vector<json> instructions;
+		for (const auto &item : instructionsValue) {
+			if (item.is_object()) {
+				instructions.push_back(item);
+			}
+		}
+		if (instructions.empty()) {
+			return "";
+		}
+
+		int crashOpcode = -1;
+		size_t bytesPerLine = 0;
+		for (size_t i = 0; i < instructions.size(); ++i) {
+			uint64_t currentOffset = JsonUInt64(instructions[i].value("offset", json()));
+			uint64_t nextOffset = (i + 1 < instructions.size()) ? JsonUInt64(instructions[i + 1].value("offset", json())) : currentOffset;
+			if (ip >= currentOffset && (i + 1 == instructions.size() || ip < nextOffset)) {
+				crashOpcode = static_cast<int>(i);
+				break;
+			}
+		}
+
+		if (crashOpcode >= 0) {
+			for (size_t i = 0; i < instructions.size(); ++i) {
+				if (static_cast<int>(i) < crashOpcode - 5 || static_cast<int>(i) > crashOpcode + 5) {
+					continue;
+				}
+				const std::string hex = JsonString(instructions[i].value("hex", json()));
+				bytesPerLine = (std::max)(bytesPerLine, hex.size() / 2);
+			}
+		}
+
+		std::ostringstream out;
+		for (size_t i = 0; i < instructions.size(); ++i) {
+			if (crashOpcode >= 0 && (static_cast<int>(i) < crashOpcode - 5 || static_cast<int>(i) > crashOpcode + 5)) {
+				continue;
+			}
+
+			std::string line = indent;
+			if (crashOpcode >= 0 && static_cast<int>(i) == crashOpcode && line.size() >= 3) {
+				line = "  >" + line.substr(3);
+			}
+
+			const uint64_t offset = JsonUInt64(instructions[i].value("offset", json()));
+			const std::string hex = JsonString(instructions[i].value("hex", json()));
+			const std::string mnemonic = JsonString(instructions[i].value("mnemonic", json()));
+
+			std::ostringstream hexFormatted;
+			for (size_t index = 0; index < hex.size(); index += 2) {
+				if (index > 0) {
+					hexFormatted << ' ';
+				}
+				hexFormatted << hex.substr(index, (std::min<size_t>)(2, hex.size() - index));
+			}
+
+			out << line << std::hex << std::setw(8) << std::setfill('0') << offset << std::dec << std::setfill(' ')
+				<< "  " << std::left << std::setw(static_cast<int>((bytesPerLine * 3) > 0 ? (bytesPerLine * 3) - 1 : 0))
+				<< hexFormatted.str() << std::right << "  " << mnemonic << "\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderCarburetorRegisters(const json &registersValue, const std::string &indent)
+	{
+		if (!registersValue.is_object()) {
+			return "";
+		}
+
+		static const std::vector<std::string> preferredOrder = {
+			"eip", "esp", "ebp", "ebx",
+			"esi", "edi", "eax", "ecx",
+			"edx", "efl",
+			"rax", "rdx", "rcx", "rbx",
+			"rsi", "rdi", "rbp", "rsp",
+			"r8", "r9", "r10", "r11",
+			"r12", "r13", "r14", "r15", "rip",
+		};
+
+		std::vector<std::pair<std::string, uint64_t>> registers;
+		std::set<std::string> printed;
+
+		for (const std::string &name : preferredOrder) {
+			auto it = registersValue.find(name);
+			if (it == registersValue.end()) {
+				continue;
+			}
+			registers.emplace_back(name, JsonUInt64(*it));
+			printed.insert(name);
+		}
+
+		for (auto it = registersValue.begin(); it != registersValue.end(); ++it) {
+			if (printed.find(it.key()) != printed.end()) {
+				continue;
+			}
+			registers.emplace_back(it.key(), JsonUInt64(it.value()));
+		}
+
+		if (registers.empty()) {
+			return "";
+		}
+
+		size_t width = 8;
+		for (const auto &entry : registers) {
+			width = (std::max)(width, HexWidthForAddress(entry.second));
+		}
+
+		std::ostringstream out;
+		size_t count = 0;
+		out << indent;
+		for (const auto &entry : registers) {
+			out << entry.first << ": 0x" << std::hex << std::setw(static_cast<int>(width)) << std::setfill('0') << entry.second << std::dec << std::setfill(' ');
+			count++;
+			if (count % 4 == 0) {
+				out << "\n";
+				if (count != registers.size()) {
+					out << indent;
+				}
+			} else if (count != registers.size()) {
+				out << "  ";
+			}
+		}
+		if (count % 4 != 0) {
+			out << "\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderCarburetorStack(const json &document)
+	{
+		std::ostringstream out;
+
+		if (document.value("crashed", false)) {
+			out << JsonString(document.value("crash_reason", json())) << " accessing 0x"
+				<< std::hex << JsonUInt64(document.value("crash_address", json())) << std::dec << "\n\n";
+		}
+
+		if (!document.contains("requesting_thread") || !document["requesting_thread"].is_number_integer()) {
+			return out.str();
+		}
+
+		const int requestingThread = document["requesting_thread"].get<int>();
+		if (!document.contains("threads") || !document["threads"].is_array() ||
+			requestingThread < 0 || requestingThread >= static_cast<int>(document["threads"].size())) {
+			return out.str();
+		}
+
+		const json &thread = document["threads"][requestingThread];
+		if (!thread.is_array()) {
+			return out.str();
+		}
+
+		out << "Thread " << requestingThread << " (crashed):\n";
+
+		const size_t numFrames = thread.size();
+		const size_t frameDigits = (std::max<size_t>)(1, std::to_string(numFrames > 0 ? numFrames - 1 : 0).size());
+
+		for (size_t i = 0; i < numFrames; ++i) {
+			const json &frame = thread[i];
+			if (!frame.is_object()) {
+				continue;
+			}
+
+			std::ostringstream prefix;
+			prefix << std::setw(static_cast<int>(frameDigits)) << std::setfill(' ') << i << ": ";
+			const std::string prefixText = prefix.str();
+			const std::string indent = "  " + std::string(prefixText.size(), ' ');
+
+			out << "  " << prefixText << JsonString(frame.value("rendered", json())) << "\n";
+
+			if (frame.contains("url") && frame["url"].is_string()) {
+				out << indent << frame["url"].get<std::string>() << "\n";
+			}
+
+			if (frame.contains("registers")) {
+				out << RenderCarburetorRegisters(frame["registers"], indent);
+				out << "\n";
+			}
+
+			if (frame.contains("instructions")) {
+				out << RenderCarburetorInstructions(frame["instructions"], JsonUInt64(frame.value("instruction", json())), indent);
+				out << "\n";
+			}
+
+			if (frame.contains("stack") && frame["stack"].is_string()) {
+				std::vector<uint8_t> decoded;
+				if (DecodeBase64(frame["stack"].get<std::string>(), decoded)) {
+					uint64_t base = 0;
+					if (frame.contains("registers") && frame["registers"].is_object()) {
+						const json &registers = frame["registers"];
+						if (registers.contains("esp")) {
+							base = JsonUInt64(registers["esp"]);
+						} else if (registers.contains("rsp")) {
+							base = JsonUInt64(registers["rsp"]);
+						}
+					}
+					out << CollectHexDump(base, decoded, indent);
+					out << "\n";
+				}
+			}
+
+			out << indent << "Found via " << FrameTrustName(static_cast<StackFrame::FrameTrust>(frame.value("trust", 0))) << "\n\n\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderCarburetorMemory(const json &document, std::string &error)
+	{
+		if (!document.contains("memory") || !document["memory"].is_array()) {
+			error = "No memory regions in carburetor JSON";
+			return "";
+		}
+
+		std::vector<json> regions;
+		for (const auto &region : document["memory"]) {
+			if (region.is_object()) {
+				regions.push_back(region);
+			}
+		}
+		if (regions.empty()) {
+			error = "No memory regions in carburetor JSON";
+			return "";
+		}
+
+		std::sort(regions.begin(), regions.end(), [](const json &left, const json &right) {
+			return JsonUInt64(left.value("base", json())) < JsonUInt64(right.value("base", json()));
+		});
+
+		const uint64_t start = JsonUInt64(regions.front().value("base", json()));
+		const uint64_t end = JsonUInt64(regions.back().value("base", json())) + JsonUInt64(regions.back().value("size", json()));
+		const uint64_t size = end > start ? (end - start) : 0;
+
+		uint64_t real = 0;
+		for (const auto &region : regions) {
+			real += JsonUInt64(region.value("size", json()));
+		}
+
+		std::ostringstream out;
+		const size_t addressWidth = HexWidthForAddress(end);
+		out << "Got " << real << " bytes of memory covering "
+			<< std::hex << std::setw(static_cast<int>(addressWidth)) << std::setfill('0') << start << " to "
+			<< std::setw(static_cast<int>(addressWidth)) << end << std::dec << std::setfill(' ')
+			<< " (" << (size > 0 ? (static_cast<double>(real) / static_cast<double>(size)) : 1.0) << "% coverage)\n\n";
+
+		for (const auto &region : regions) {
+			const uint64_t base = JsonUInt64(region.value("base", json()));
+			const uint64_t declaredSize = JsonUInt64(region.value("size", json()));
+			std::vector<uint8_t> decoded;
+			if (!DecodeBase64(JsonString(region.value("data", json())), decoded)) {
+				error = "Failed to decode base64 memory region";
+				return "";
+			}
+			if (decoded.size() != declaredSize) {
+				error = "Decoded memory region size mismatch";
+				return "";
+			}
+			out << CollectHexDump(base, decoded, "");
+			out << "\n";
+		}
+
+		return out.str();
+	}
+
+	size_t HexWidthForAddress(uint64_t value)
+	{
+		return value > 0xFFFFFFFFULL ? 16 : 8;
+	}
+
+	std::string RenderFrame(const StackFrame *frame)
+	{
+		std::ostringstream out;
+		out << std::hex;
+		if (frame->module) {
+			out << PathnameStripper::File(frame->module->code_file());
+			if (!frame->function_name.empty()) {
+				out << "!" << frame->function_name;
+				if (!frame->source_file_name.empty()) {
+					out << " [ " << PathnameStripper::File(frame->source_file_name) << ":" << std::dec << frame->source_line
+						<< std::hex << " + 0x" << (frame->ReturnAddress() - frame->source_line_base) << " ]";
+				} else {
+					out << " + 0x" << (frame->ReturnAddress() - frame->function_base);
+				}
+			} else {
+				out << " + 0x" << (frame->ReturnAddress() - frame->module->base_address());
+			}
+		} else {
+			out << "0x" << frame->ReturnAddress();
+		}
+		out << std::dec;
+		return out.str();
+	}
+
+	std::optional<std::vector<uint8_t>> GetFrameStackContents(const StackFrame *frame,
+		const StackFrame *prevFrame,
+		const std::string &cpu,
+		const MemoryRegion *memory)
+	{
+		if (!memory) {
+			return {};
+		}
+
+		uint64_t stackBegin = 0;
+		uint64_t stackEnd = 0;
+		if (cpu == "x86") {
+			const StackFrameX86 *frameX86 = static_cast<const StackFrameX86 *>(frame);
+			const StackFrameX86 *prevFrameX86 = static_cast<const StackFrameX86 *>(prevFrame);
+			if ((frameX86->context_validity & StackFrameX86::CONTEXT_VALID_ESP) &&
+				(prevFrameX86->context_validity & StackFrameX86::CONTEXT_VALID_ESP)) {
+				stackBegin = frameX86->context.esp;
+				stackEnd = prevFrameX86->context.esp;
+			}
+		} else if (cpu == "amd64") {
+			const StackFrameAMD64 *frameAMD64 = static_cast<const StackFrameAMD64 *>(frame);
+			const StackFrameAMD64 *prevFrameAMD64 = static_cast<const StackFrameAMD64 *>(prevFrame);
+			if ((frameAMD64->context_validity & StackFrameAMD64::CONTEXT_VALID_RSP) &&
+				(prevFrameAMD64->context_validity & StackFrameAMD64::CONTEXT_VALID_RSP)) {
+				stackBegin = frameAMD64->context.rsp;
+				stackEnd = prevFrameAMD64->context.rsp;
+			}
+		}
+
+		if (!stackBegin || !stackEnd || stackEnd <= stackBegin) {
+			return {};
+		}
+
+		size_t stackSize = static_cast<size_t>(stackEnd - stackBegin);
+		std::vector<uint8_t> bytes;
+		bytes.reserve(stackSize);
+
+		for (uint64_t address = stackBegin; address < stackEnd; ++address) {
+			uint8_t value = 0;
+			if (!memory->GetMemoryAtAddress(address, &value)) {
+				return {};
+			}
+			bytes.push_back(value);
+		}
+
+		return bytes;
+	}
+
+	std::string CollectHexDump(uint64_t base, const std::vector<uint8_t> &memory, const std::string &indent)
+	{
+		std::ostringstream out;
+		const size_t rowBytes = 16;
+		const size_t chunkBytes = 8;
+		const size_t addressWidth = HexWidthForAddress(base + memory.size());
+
+		for (size_t offset = 0; offset < memory.size(); offset += rowBytes) {
+			out << indent << std::hex << std::setw(static_cast<int>(addressWidth)) << std::setfill('0') << (base + offset) << "  ";
+
+			std::string ascii;
+			for (size_t i = 0; i < rowBytes; ++i) {
+				if (offset + i < memory.size()) {
+					unsigned byte = memory[offset + i];
+					out << std::setw(2) << byte << " ";
+					ascii.push_back((byte >= 32 && byte <= 126) ? static_cast<char>(byte) : '.');
+				} else {
+					out << "   ";
+					ascii.push_back(' ');
+				}
+
+				if (i + 1 < rowBytes && ((i + 1) % chunkBytes) == 0) {
+					out << ' ';
+				}
+			}
+
+			out << " " << ascii << "\n";
+		}
+
+		out << std::dec << std::setfill(' ');
+		return out.str();
+	}
+
+	void AppendRegisterDump(std::ostringstream &out, const StackFrame *frame, const std::string &indent)
+	{
+		if (!frame) {
+			return;
+		}
+
+		auto appendLine = [&](const std::vector<std::pair<const char *, uint64_t>> &registers) {
+			size_t count = 0;
+			size_t registerWidth = 8;
+			for (const auto &entry : registers) {
+				registerWidth = (std::max)(registerWidth, HexWidthForAddress(entry.second));
+			}
+			out << indent;
+			for (const auto &entry : registers) {
+				out << entry.first << ": 0x" << std::hex << std::setw(static_cast<int>(registerWidth)) << std::setfill('0') << entry.second << std::dec << std::setfill(' ');
+				count++;
+				if (count % 4 == 0) {
+					out << "\n";
+					if (count != registers.size()) {
+						out << indent;
+					}
+				} else if (count != registers.size()) {
+					out << "  ";
+				}
+			}
+			if (count % 4 != 0) {
+				out << "\n";
+			}
+		};
+
+		if (const auto *frameX86 = dynamic_cast<const StackFrameX86 *>(frame)) {
+			std::vector<std::pair<const char *, uint64_t>> registers = {
+				{"eip", frameX86->context.eip},
+				{"esp", frameX86->context.esp},
+				{"ebp", frameX86->context.ebp},
+				{"ebx", frameX86->context.ebx},
+				{"esi", frameX86->context.esi},
+				{"edi", frameX86->context.edi},
+				{"eax", frameX86->context.eax},
+				{"ecx", frameX86->context.ecx},
+				{"edx", frameX86->context.edx},
+				{"efl", frameX86->context.eflags},
+			};
+			appendLine(registers);
+		} else if (const auto *frameAMD64 = dynamic_cast<const StackFrameAMD64 *>(frame)) {
+			std::vector<std::pair<const char *, uint64_t>> registers = {
+				{"rip", frameAMD64->context.rip},
+				{"rsp", frameAMD64->context.rsp},
+				{"rbp", frameAMD64->context.rbp},
+				{"rax", frameAMD64->context.rax},
+				{"rbx", frameAMD64->context.rbx},
+				{"rcx", frameAMD64->context.rcx},
+				{"rdx", frameAMD64->context.rdx},
+				{"rsi", frameAMD64->context.rsi},
+				{"rdi", frameAMD64->context.rdi},
+				{"r8", frameAMD64->context.r8},
+				{"r9", frameAMD64->context.r9},
+				{"r10", frameAMD64->context.r10},
+				{"r11", frameAMD64->context.r11},
+				{"r12", frameAMD64->context.r12},
+				{"r13", frameAMD64->context.r13},
+				{"r14", frameAMD64->context.r14},
+				{"r15", frameAMD64->context.r15},
+			};
+			appendLine(registers);
+		}
+	}
+
+	const char *FrameTrustName(StackFrame::FrameTrust trust)
+	{
+		static const char *names[] = {
+			"unknown",
+			"stack scanning",
+			"call frame info with scanning",
+			"previous frame's frame pointer",
+			"call frame info",
+			"external stack walker",
+			"instruction pointer in context",
+		};
+
+		size_t index = static_cast<size_t>(trust);
+		if (index >= (sizeof(names) / sizeof(names[0]))) {
+			return names[0];
+		}
+		return names[index];
+	}
+
+	bool LoadDump(LoadedDump &loadedDump, std::string &error)
+	{
+		{
+			StderrInhibitor stderrInhibitor;
+			if (!loadedDump.minidump.Read()) {
+				error = "Minidump could not be read";
+				return false;
+			}
+
+			MinidumpProcessor processor(nullptr, nullptr);
+			ProcessResult result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+			if (result != google_breakpad::PROCESS_OK) {
+				std::ostringstream out;
+				out << "MinidumpProcessor failed with status " << result;
+				error = out.str();
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool ReloadDumpWithLocalSymbols(LoadedDump &loadedDump,
+		const std::vector<std::string> &symbolPaths,
+		std::string &error)
+	{
+		std::unique_ptr<SimpleSymbolSupplier> symbolSupplier;
+		if (!symbolPaths.empty()) {
+			symbolSupplier.reset(new SimpleSymbolSupplier(symbolPaths));
+		}
+
+		BasicSourceLineResolver resolver;
+		MinidumpProcessor processor(symbolSupplier.get(), &resolver);
+		loadedDump.processState = ProcessState();
+
+		{
+			StderrInhibitor stderrInhibitor;
+			ProcessResult result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+			if (result != google_breakpad::PROCESS_OK) {
+				std::ostringstream out;
+				out << "Symbolized MinidumpProcessor failed with status " << result;
+				error = out.str();
+				return false;
+			}
+		}
+		return true;
+	}
+
+	const CallStack *GetRequestingThreadStack(const ProcessState &processState, int &threadIndex)
+	{
+		threadIndex = processState.requesting_thread();
+		if (threadIndex < 0) {
+			threadIndex = 0;
+		}
+
+		const auto *threads = processState.threads();
+		if (!threads || threads->empty() || threadIndex >= static_cast<int>(threads->size())) {
+			return nullptr;
+		}
+		return threads->at(threadIndex);
+	}
+
+	std::string RenderShortStackTrace(const ProcessState &processState)
+	{
+		std::ostringstream out;
+		out << "Crash reason: " << processState.crash_reason() << "\n";
+		out << "Crash address: 0x" << std::hex << processState.crash_address() << std::dec << "\n";
+
+		int threadIndex = 0;
+		const CallStack *stack = GetRequestingThreadStack(processState, threadIndex);
+		if (!stack) {
+			out << "No crashed thread stack is available.\n";
+			return out.str();
+		}
+
+		out << "Crashed thread: " << threadIndex << "\n";
+		const auto *frames = stack->frames();
+		for (size_t i = 0; i < frames->size(); ++i) {
+			out << "#" << i << " " << RenderFrame(frames->at(i)) << "\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderVerboseStack(const LoadedDump &loadedDump)
+	{
+		std::ostringstream out;
+		const ProcessState &processState = loadedDump.processState;
+		const std::string cpu = processState.system_info() ? processState.system_info()->cpu : "";
+
+		int threadIndex = 0;
+		const CallStack *stack = GetRequestingThreadStack(processState, threadIndex);
+		if (!stack) {
+			out << "No crashed thread stack is available.\n";
+			return out.str();
+		}
+
+		out << processState.crash_reason() << " accessing 0x" << std::hex << processState.crash_address() << std::dec << "\n\n";
+		out << "Thread " << threadIndex << " (crashed):\n\n";
+
+		const auto *threadMemoryRegions = processState.thread_memory_regions();
+		const MemoryRegion *threadMemory = nullptr;
+		if (threadMemoryRegions && threadIndex >= 0 && threadIndex < static_cast<int>(threadMemoryRegions->size())) {
+			threadMemory = threadMemoryRegions->at(threadIndex);
+		}
+
+		const auto *frames = stack->frames();
+		for (size_t i = 0; i < frames->size(); ++i) {
+			const StackFrame *frame = frames->at(i);
+			std::string prefix = std::to_string(i) + ": ";
+			std::string indent = "  " + std::string(prefix.size(), ' ');
+
+			out << "  " << prefix << RenderFrame(frame) << "\n";
+			AppendRegisterDump(out, frame, indent);
+
+			if (threadMemory && i + 1 < frames->size()) {
+				std::optional<std::vector<uint8_t>> stackBytes = GetFrameStackContents(frame, frames->at(i + 1), cpu, threadMemory);
+				if (stackBytes && !stackBytes->empty()) {
+					uint64_t stackBase = 0;
+					if (cpu == "x86") {
+						stackBase = static_cast<const StackFrameX86 *>(frame)->context.esp;
+					} else if (cpu == "amd64") {
+						stackBase = static_cast<const StackFrameAMD64 *>(frame)->context.rsp;
+					}
+					out << CollectHexDump(stackBase, *stackBytes, indent);
+				}
+			}
+
+			out << indent << "Found via " << FrameTrustName(frame->trust) << "\n\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderMemoryDump(Minidump &minidump)
+	{
+		std::ostringstream out;
+		MinidumpMemoryList *memoryList = minidump.GetMemoryList();
+		if (!memoryList || memoryList->region_count() == 0) {
+			out << "No memory regions in input\n";
+			return out.str();
+		}
+
+		uint64_t start = (std::numeric_limits<uint64_t>::max)();
+		uint64_t end = 0;
+		uint64_t totalBytes = 0;
+		for (unsigned int i = 0; i < memoryList->region_count(); ++i) {
+			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
+			start = (std::min)(start, region->GetBase());
+			end = (std::max)(end, region->GetBase() + region->GetSize());
+			totalBytes += region->GetSize();
+		}
+
+		uint64_t covered = end > start ? (end - start) : 0;
+		double coverage = covered > 0 ? (static_cast<double>(totalBytes) / static_cast<double>(covered)) * 100.0 : 100.0;
+		const size_t addressWidth = HexWidthForAddress(end);
+		out << "Got " << totalBytes << " bytes of memory covering "
+			<< std::hex << std::setw(static_cast<int>(addressWidth)) << std::setfill('0') << start << " to "
+			<< std::setw(static_cast<int>(addressWidth)) << end << std::dec << std::setfill(' ')
+			<< " (" << std::fixed << std::setprecision(2) << coverage << "% coverage)\n";
+
+		for (unsigned int i = 0; i < memoryList->region_count(); ++i) {
+			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
+			const uint8_t *buffer = region->GetMemory();
+			if (!buffer || region->GetSize() == 0) {
+				continue;
+			}
+
+			std::vector<uint8_t> bytes(buffer, buffer + region->GetSize());
+			out << "\nRegion " << i << ": base=0x" << std::hex << region->GetBase() << std::dec << " size=" << region->GetSize() << "\n";
+			out << CollectHexDump(region->GetBase(), bytes, "  ");
+		}
+
+		return out.str();
+	}
+
+	std::string RenderRawJson(LoadedDump &loadedDump)
+	{
+		std::ostringstream out;
+		const ProcessState &processState = loadedDump.processState;
+
+		out << "{\n";
+		out << "  \"input_file\": \"" << EscapeJson(loadedDump.minidump.path()) << "\",\n";
+		out << "  \"crashed\": " << (processState.crashed() ? "true" : "false") << ",\n";
+		out << "  \"crash_reason\": \"" << EscapeJson(processState.crash_reason()) << "\",\n";
+		out << "  \"crash_address\": " << processState.crash_address() << ",\n";
+		out << "  \"requesting_thread\": " << processState.requesting_thread() << ",\n";
+		out << "  \"threads\": [\n";
+
+		const auto *threads = processState.threads();
+		for (size_t threadIndex = 0; threads && threadIndex < threads->size(); ++threadIndex) {
+			const CallStack *stack = threads->at(threadIndex);
+			out << "    {\n";
+			out << "      \"index\": " << threadIndex << ",\n";
+			out << "      \"frames\": [\n";
+
+			const auto *frames = stack->frames();
+			for (size_t frameIndex = 0; frameIndex < frames->size(); ++frameIndex) {
+				const StackFrame *frame = frames->at(frameIndex);
+				out << "        {"
+					<< "\"frame\": " << frameIndex
+					<< ", \"rendered\": \"" << EscapeJson(RenderFrame(frame)) << "\"";
+				if (frame->module) {
+					out << ", \"module\": \"" << EscapeJson(PathnameStripper::File(frame->module->code_file())) << "\"";
+				}
+				if (!frame->function_name.empty()) {
+					out << ", \"function\": \"" << EscapeJson(frame->function_name) << "\"";
+				}
+				out << "}";
+				if (frameIndex + 1 < frames->size()) {
+					out << ",";
+				}
+				out << "\n";
+			}
+
+			out << "      ]\n";
+			out << "    }";
+			if (threadIndex + 1 < threads->size()) {
+				out << ",";
+			}
+			out << "\n";
+		}
+
+		out << "  ],\n";
+		out << "  \"memory_regions\": [\n";
+
+		MinidumpMemoryList *memoryList = loadedDump.minidump.GetMemoryList();
+		for (unsigned int i = 0; memoryList && i < memoryList->region_count(); ++i) {
+			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
+			out << "    {\"base\": " << region->GetBase() << ", \"size\": " << region->GetSize() << "}";
+			if (i + 1 < memoryList->region_count()) {
+				out << ",";
+			}
+			out << "\n";
+		}
+
+		out << "  ]\n";
+		out << "}\n";
+		return out.str();
+	}
+
+	std::string StripTrailingNewlinesCopy(const std::string &input)
+	{
+		std::string result = input;
+		while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+			result.pop_back();
+		}
+		return result;
+	}
+
+	std::string StripLeadingNonJson(const std::string &raw)
+	{
+		size_t objectPos = raw.find('{');
+		size_t arrayPos = raw.find('[');
+		size_t jsonPos = std::string::npos;
+		if (objectPos != std::string::npos && arrayPos != std::string::npos) {
+			jsonPos = (std::min)(objectPos, arrayPos);
+		} else if (objectPos != std::string::npos) {
+			jsonPos = objectPos;
+		} else {
+			jsonPos = arrayPos;
+		}
+
+		if (jsonPos == std::string::npos) {
+			return raw;
+		}
+
+		return raw.substr(jsonPos);
+	}
+
+	std::string ExtractConsoleHistorySection(const std::string &metadata)
+	{
+		static const std::string beginMarker = "-------- CONSOLE HISTORY BEGIN --------\n";
+		static const std::string endMarker = "-------- CONSOLE HISTORY END --------";
+
+		size_t begin = metadata.find(beginMarker);
+		if (begin == std::string::npos) {
+			return "";
+		}
+		begin += beginMarker.size();
+
+		size_t end = metadata.find(endMarker, begin);
+		if (end == std::string::npos) {
+			end = metadata.size();
+		}
+
+		return StripTrailingNewlinesCopy(metadata.substr(begin, end - begin));
+	}
+
+	std::string StripConsoleHistorySection(const std::string &metadata)
+	{
+		static const std::string beginMarker = "-------- CONSOLE HISTORY BEGIN --------\n";
+		size_t begin = metadata.find(beginMarker);
+		if (begin == std::string::npos) {
+			return metadata;
+		}
+
+		return StripTrailingNewlinesCopy(metadata.substr(0, begin));
+	}
+
+	std::string BuildTraceReport(const PendingDumpEntry &entry, const LoadedDump &loadedDump, bool includeConsoleHistory);
+
+	std::string BuildTraceReport(const PendingDumpEntry &entry, const LoadedDump &loadedDump)
+	{
+		return BuildTraceReport(entry, loadedDump, true);
+	}
+
+	std::string BuildTraceReport(const PendingDumpEntry &entry, const LoadedDump &loadedDump, bool includeConsoleHistory)
+	{
+		std::ostringstream out;
+		out << RenderShortStackTrace(loadedDump.processState);
+		if (entry.hasMetadata) {
+			std::string metadata = ReadWholeFile(entry.metadataPath);
+			if (!metadata.empty()) {
+				std::string filteredMetadata = includeConsoleHistory ? metadata : StripConsoleHistorySection(metadata);
+				if (filteredMetadata.empty()) {
+					return out.str();
+				}
+				out << (includeConsoleHistory ? "\n-------- METADATA / CONSOLE --------\n" : "\n-------- METADATA --------\n");
+				out << filteredMetadata;
+				if (filteredMetadata.back() != '\n') {
+					out << "\n";
+				}
+			}
+		}
+		return out.str();
+	}
+
+	bool IsSupportedDumpMode(const std::string &mode)
+	{
+		return mode == "trace" || mode == "rawstack" || mode == "rawmemory" || mode == "rawraw" || mode == "all";
+	}
+
+	std::string ResolveOutputPath(const PendingDumpEntry &entry,
+		const std::string &requestedOutput,
+		const std::string &normalizedMode,
+		const std::string &outputRoot)
+	{
+		if (!requestedOutput.empty()) {
+			if (IsAbsolutePath(requestedOutput)) {
+				return NormalizePathString(std::filesystem::u8path(requestedOutput));
+			}
+			return NormalizePathString(std::filesystem::u8path(outputRoot) / std::filesystem::u8path(requestedOutput));
+		}
+
+		return NormalizePathString(std::filesystem::u8path(outputRoot) / (normalizedMode + "_" + entry.name + ".txt"));
+	}
+
+	bool BuildOutputForMode(const PendingDumpEntry &entry,
+		LoadedDump &loadedDump,
+		const LocalDumpSettings &settings,
+		const std::string &normalizedMode,
+		std::string &output)
+	{
+		std::string carburetorRaw;
+		std::string carburetorError;
+		bool hasCarburetorRaw = false;
+		json carburetorDocument;
+		bool hasCarburetorJson = false;
+		if (normalizedMode == "rawstack" || normalizedMode == "rawmemory" || normalizedMode == "rawraw" || normalizedMode == "all") {
+			hasCarburetorRaw = TryRunCarburetorRaw(entry, settings, carburetorRaw, carburetorError);
+			if (hasCarburetorRaw) {
+				hasCarburetorJson = ParseCarburetorJson(carburetorRaw, carburetorDocument, carburetorError);
+			}
+		}
+
+		if (normalizedMode == "trace") {
+			output = BuildTraceReport(entry, loadedDump);
+			return true;
+		}
+		if (normalizedMode == "rawstack") {
+			if (hasCarburetorJson) {
+				output = RenderCarburetorStack(carburetorDocument);
+			} else {
+				output = RenderVerboseStack(loadedDump);
+				if (!carburetorError.empty()) {
+					output = std::string("Carburetor unavailable, using built-in raw stack view.\nReason: ") + carburetorError + "\n\n" + output;
+				}
+			}
+			return true;
+		}
+		if (normalizedMode == "rawmemory") {
+			if (hasCarburetorJson) {
+				std::string memoryError;
+				output = RenderCarburetorMemory(carburetorDocument, memoryError);
+				if (output.empty()) {
+					output = RenderMemoryDump(loadedDump.minidump);
+					const std::string reason = !memoryError.empty() ? memoryError : carburetorError;
+					if (!reason.empty()) {
+						output = std::string("Carburetor unavailable, using built-in raw memory view.\nReason: ") + reason + "\n\n" + output;
+					}
+				}
+			} else {
+				output = RenderMemoryDump(loadedDump.minidump);
+				if (!carburetorError.empty()) {
+					output = std::string("Carburetor unavailable, using built-in raw memory view.\nReason: ") + carburetorError + "\n\n" + output;
+				}
+			}
+			return true;
+		}
+		if (normalizedMode == "rawraw") {
+			output = hasCarburetorRaw ? carburetorRaw : RenderRawJson(loadedDump);
+			if (!hasCarburetorRaw && !carburetorError.empty()) {
+				output = std::string("Carburetor unavailable, using built-in raw view.\nReason: ") + carburetorError + "\n\n" + output;
+			}
+			return true;
+		}
+		if (normalizedMode == "all") {
+			std::ostringstream out;
+			out << "======== TRACE ========\n" << BuildTraceReport(entry, loadedDump)
+				<< "\n======== RAWSTACK ========\n";
+			if (hasCarburetorJson) {
+				out << RenderCarburetorStack(carburetorDocument);
+			} else {
+				if (!carburetorError.empty()) {
+					out << "Carburetor unavailable, using built-in raw stack view.\nReason: " << carburetorError << "\n\n";
+				}
+				out << RenderVerboseStack(loadedDump);
+			}
+
+			out << "\n======== RAWMEMORY ========\n";
+			if (hasCarburetorJson) {
+				std::string memoryError;
+				std::string memoryOutput = RenderCarburetorMemory(carburetorDocument, memoryError);
+				if (!memoryOutput.empty()) {
+					out << memoryOutput;
+				} else {
+					if (!memoryError.empty()) {
+						out << "Carburetor unavailable, using built-in raw memory view.\nReason: " << memoryError << "\n\n";
+					}
+					out << RenderMemoryDump(loadedDump.minidump);
+				}
+			} else {
+				if (!carburetorError.empty()) {
+					out << "Carburetor unavailable, using built-in raw memory view.\nReason: " << carburetorError << "\n\n";
+				}
+				out << RenderMemoryDump(loadedDump.minidump);
+			}
+
+			out
+				<< "\n======== RAWRAW ========\n";
+			if (hasCarburetorRaw) {
+				out << carburetorRaw;
+			} else {
+				if (!carburetorError.empty()) {
+					out << "Carburetor unavailable, using built-in raw view.\nReason: " << carburetorError << "\n\n";
+				}
+				out << RenderRawJson(loadedDump);
+			}
+			output = out.str();
+			return true;
+		}
+		return false;
+	}
+
+	void LogMultilineResult(const char *header, const std::string &text)
+	{
+		if (header && header[0]) {
+			AcceleratorConsoleWarning("%s", header);
+		}
+
+		size_t start = 0;
+		while (start < text.size()) {
+			size_t end = text.find('\n', start);
+			std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			if (!line.empty()) {
+				AcceleratorConsoleWarning("%s", line.c_str());
+			}
+			if (end == std::string::npos) {
+				break;
+			}
+			start = end + 1;
+		}
+	}
+}
+
+bool Accelerator_LocalListDumps(std::string &output, std::string &error)
+{
+	std::vector<PendingDumpEntry> entries;
+	if (!CollectPendingDumps(entries, &error)) {
+		return false;
+	}
+
+	std::ostringstream out;
+	if (entries.empty()) {
+		out << "No pending dump files were found.\n";
+		output = out.str();
+		return true;
+	}
+
+	out << "Found " << static_cast<unsigned>(entries.size()) << " pending dump(s):\n";
+	for (const PendingDumpEntry &entry : entries) {
+		out << "  " << entry.name << (entry.hasMetadata ? " [metadata]" : "") << "\n";
+	}
+	output = out.str();
+	return true;
+}
+
+namespace
+{
+	std::mutex localDumpJobMutex;
+	std::condition_variable localDumpJobCv;
+	std::map<int, std::shared_ptr<LocalDumpJob>> localDumpJobs;
+	std::deque<int> localDumpJobQueue;
+	std::thread localDumpWorkerThread;
+	std::atomic_bool localDumpWorkerStop{false};
+	int nextLocalDumpJobId = 1;
+	constexpr size_t kLocalDumpFinishedRetention = 32;
+
+	const char *LocalDumpJobStateName(LocalDumpJobState state)
+	{
+		switch (state) {
+			case LocalDumpJobState::Queued: return "queued";
+			case LocalDumpJobState::Running: return "running";
+			case LocalDumpJobState::Done: return "done";
+			case LocalDumpJobState::Failed: return "failed";
+		}
+		return "unknown";
+	}
+
+	LocalDumpSettings CollectCurrentLocalDumpSettings()
+	{
+		LocalDumpSettings settings;
+		settings.gamePath = crashGamePath;
+		settings.sourceModPath = crashSourceModPath;
+		settings.carburetorPath = GetConfiguredCarburetorPath();
+		settings.symbolPaths = GetConfiguredLocalSymbolPaths();
+		settings.localSymbolStoreRoot = GetLocalSymbolStoreRoot();
+		settings.localOutputRoot = GetLocalOutputRoot();
+#if defined _WINDOWS
+		settings.dumpSymsPath = NormalizePathString(std::filesystem::u8path(crashSourceModPath) / "bin" / "dump_syms.exe");
+#endif
+		return settings;
+	}
+
+	void TrimFinishedLocalDumpJobsLocked()
+	{
+		while (localDumpJobs.size() > kLocalDumpFinishedRetention) {
+			auto it = std::find_if(localDumpJobs.begin(), localDumpJobs.end(), [](const auto &entry) {
+				return entry.second->state == LocalDumpJobState::Done || entry.second->state == LocalDumpJobState::Failed;
+			});
+			if (it == localDumpJobs.end()) {
+				break;
+			}
+			localDumpJobs.erase(it);
+		}
+	}
+
+	bool BuildLocalDumpTask(LocalDumpJob &job, std::string &error)
+	{
+		if (job.dumpName.empty()) {
+			error = "Dump name is empty";
+			return false;
+		}
+		if (!job.stackOnly && !IsSupportedDumpMode(job.mode)) {
+			error = "Invalid dump mode";
+			return false;
+		}
+		if (!FindPendingDumpByName(job.dumpName, job.entry, &error)) {
+			return false;
+		}
+
+		job.settings = CollectCurrentLocalDumpSettings();
+		if (!job.stackOnly) {
+			job.outputPath = ResolveOutputPath(job.entry, job.requestedOutputPath, job.mode, job.settings.localOutputRoot);
+		}
+		return true;
+	}
+
+	bool ExecuteLocalDumpTask(LocalDumpJob &job, std::string &error)
+	{
+		LoadedDump loadedDump(job.entry.dumpPath);
+		if (!LoadDump(loadedDump, error)) {
+			return false;
+		}
+
+		EnsureLocalSymbolsForDump(loadedDump, job.settings);
+		if (!ReloadDumpWithLocalSymbols(loadedDump, job.settings.symbolPaths, error)) {
+			return false;
+		}
+
+		if (job.stackOnly) {
+			job.result = BuildTraceReport(job.entry, loadedDump, false);
+			std::ostringstream out;
+			out << "Built stack dump for " << job.dumpName;
+			job.status = out.str();
+			return true;
+		}
+
+		std::string output;
+		if (!BuildOutputForMode(job.entry, loadedDump, job.settings, job.mode, output)) {
+			error = "Unsupported mode";
+			return false;
+		}
+
+		std::string directoryError;
+		if (!EnsureDirectoryExists(std::filesystem::path(job.outputPath).parent_path().string(), directoryError)) {
+			error = directoryError;
+			return false;
+		}
+		if (!WriteWholeFile(job.outputPath, output, &error)) {
+			return false;
+		}
+
+		std::ostringstream out;
+		out << "Wrote " << job.mode << " output for " << job.dumpName << " to " << job.outputPath;
+		job.status = out.str();
+		job.result = job.status;
+		return true;
+	}
+
+	void LocalDumpWorkerLoop()
+	{
+		for (;;) {
+			std::shared_ptr<LocalDumpJob> job;
+			{
+				std::unique_lock<std::mutex> lock(localDumpJobMutex);
+				localDumpJobCv.wait(lock, []() {
+					return localDumpWorkerStop.load() || !localDumpJobQueue.empty();
+				});
+
+				if (localDumpWorkerStop.load() && localDumpJobQueue.empty()) {
+					return;
+				}
+
+				int jobId = localDumpJobQueue.front();
+				localDumpJobQueue.pop_front();
+
+				auto it = localDumpJobs.find(jobId);
+				if (it == localDumpJobs.end()) {
+					continue;
+				}
+
+				job = it->second;
+				job->state = LocalDumpJobState::Running;
+				job->status = "Job is running";
+			}
+
+			AcceleratorConsoleWarning("Local dump job #%d started: %s%s",
+				job->id,
+				job->dumpName.c_str(),
+				job->stackOnly ? " [stack]" : "");
+
+			std::string error;
+			const bool succeeded = ExecuteLocalDumpTask(*job, error);
+
+			{
+				std::lock_guard<std::mutex> lock(localDumpJobMutex);
+				job->finishedAt = std::chrono::system_clock::now();
+				if (succeeded) {
+					job->state = LocalDumpJobState::Done;
+				} else {
+					job->state = LocalDumpJobState::Failed;
+					job->error = error;
+					job->status = error;
+				}
+				TrimFinishedLocalDumpJobsLocked();
+			}
+
+			if (succeeded) {
+				AcceleratorConsoleWarning("Local dump job #%d finished: %s", job->id, job->status.c_str());
+				if (job->stackOnly) {
+					std::ostringstream header;
+					header << "Local dump job #" << job->id << " stack trace for " << job->dumpName << ":";
+					LogMultilineResult(header.str().c_str(), job->result);
+				} else {
+					AcceleratorConsoleWarning("Local dump job #%d result: %s", job->id, job->result.c_str());
+				}
+			} else {
+				AcceleratorConsoleWarning("Local dump job #%d failed: %s", job->id, error.c_str());
+			}
+		}
+	}
+
+	void StartLocalDumpWorker()
+	{
+		localDumpWorkerStop.store(false);
+		if (!localDumpWorkerThread.joinable()) {
+			localDumpWorkerThread = std::thread(LocalDumpWorkerLoop);
+		}
+	}
+
+	void StopLocalDumpWorker()
+	{
+		localDumpWorkerStop.store(true);
+		localDumpJobCv.notify_all();
+		if (localDumpWorkerThread.joinable()) {
+			localDumpWorkerThread.join();
+		}
+	}
+
+	bool EnqueueLocalDumpJob(std::shared_ptr<LocalDumpJob> job, int &jobId, std::string &status, std::string &error)
+	{
+		if (!job) {
+			error = "Job allocation failed";
+			return false;
+		}
+		if (!BuildLocalDumpTask(*job, error)) {
+			return false;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(localDumpJobMutex);
+			job->id = nextLocalDumpJobId++;
+			job->createdAt = std::chrono::system_clock::now();
+			job->state = LocalDumpJobState::Queued;
+			job->status = "Job is queued";
+			localDumpJobs[job->id] = job;
+			localDumpJobQueue.push_back(job->id);
+			AcceleratorConsoleWarning("Local dump job #%d queued: %s%s",
+				job->id,
+				job->dumpName.c_str(),
+				job->stackOnly ? " [stack]" : "");
+		}
+
+		localDumpJobCv.notify_one();
+
+		jobId = job->id;
+		std::ostringstream out;
+		out << "Started local dump job #" << jobId << " for " << job->dumpName;
+		status = out.str();
+		return true;
+	}
+}
+
+bool Accelerator_LocalListJobs(std::string &output, std::string &error)
+{
+	std::lock_guard<std::mutex> lock(localDumpJobMutex);
+	std::ostringstream out;
+	if (localDumpJobs.empty()) {
+		out << "No local dump jobs exist.\n";
+		output = out.str();
+		return true;
+	}
+
+	out << "Found " << static_cast<unsigned>(localDumpJobs.size()) << " local dump job(s):\n";
+	for (const auto &entry : localDumpJobs) {
+		const LocalDumpJob &job = *entry.second;
+		out << "  #" << job.id << " [" << LocalDumpJobStateName(job.state) << "] "
+			<< job.dumpName;
+		if (!job.mode.empty()) {
+			out << " mode=" << job.mode;
+		} else if (job.stackOnly) {
+			out << " mode=stack";
+		}
+		if (!job.outputPath.empty()) {
+			out << " output=" << job.outputPath;
+		}
+		out << "\n";
+	}
+	output = out.str();
+	return true;
+}
+
+bool Accelerator_LocalProcessDump(const char *dumpName,
+	const char *mode,
+	const char *outputName,
+	std::string &outputPath,
+	std::string &status,
+	std::string &error)
+{
+	std::string dumpNameString = dumpName ? dumpName : "";
+	std::string modeString = ToLowerCopy(mode ? mode : "");
+	std::string outputNameString = outputName ? outputName : "";
+
+	if (dumpNameString.empty() || !IsSupportedDumpMode(modeString)) {
+		error = "Invalid dump name or mode";
+		return false;
+	}
+
+	PendingDumpEntry entry;
+	if (!FindPendingDumpByName(dumpNameString, entry, &error)) {
+		return false;
+	}
+
+	LoadedDump loadedDump(entry.dumpPath);
+	if (!LoadDump(loadedDump, error)) {
+		return false;
+	}
+
+	const LocalDumpSettings settings = CollectCurrentLocalDumpSettings();
+	EnsureLocalSymbolsForDump(loadedDump, settings);
+	if (!ReloadDumpWithLocalSymbols(loadedDump, settings.symbolPaths, error)) {
+		return false;
+	}
+
+	std::string output;
+	if (!BuildOutputForMode(entry, loadedDump, settings, modeString, output)) {
+		error = "Unsupported mode";
+		return false;
+	}
+
+	outputPath = ResolveOutputPath(entry, outputNameString, modeString, settings.localOutputRoot);
+	std::string directoryError;
+	if (!EnsureDirectoryExists(std::filesystem::path(outputPath).parent_path().string(), directoryError)) {
+		error = directoryError;
+		return false;
+	}
+	if (!WriteWholeFile(outputPath, output, &error)) {
+		return false;
+	}
+
+	std::ostringstream out;
+	out << "Wrote " << modeString << " output for " << dumpNameString << " to " << outputPath;
+	status = out.str();
+	return true;
+}
+
+bool Accelerator_LocalStartProcessDump(const char *dumpName,
+	const char *mode,
+	const char *outputName,
+	int &jobId,
+	std::string &status,
+	std::string &error)
+{
+	auto job = std::make_shared<LocalDumpJob>();
+	job->dumpName = dumpName ? dumpName : "";
+	job->mode = ToLowerCopy(mode ? mode : "");
+	job->requestedOutputPath = outputName ? outputName : "";
+	job->stackOnly = false;
+	return EnqueueLocalDumpJob(job, jobId, status, error);
+}
+
+bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace, std::string &error)
+{
+	std::string dumpNameString = dumpName ? dumpName : "";
+	if (dumpNameString.empty()) {
+		error = "Dump name is empty";
+		return false;
+	}
+
+	PendingDumpEntry entry;
+	if (!FindPendingDumpByName(dumpNameString, entry, &error)) {
+		return false;
+	}
+
+	LoadedDump loadedDump(entry.dumpPath);
+	if (!LoadDump(loadedDump, error)) {
+		return false;
+	}
+
+	const LocalDumpSettings settings = CollectCurrentLocalDumpSettings();
+	EnsureLocalSymbolsForDump(loadedDump, settings);
+	if (!ReloadDumpWithLocalSymbols(loadedDump, settings.symbolPaths, error)) {
+		return false;
+	}
+
+	stackTrace = BuildTraceReport(entry, loadedDump, false);
+	return true;
+}
+
+bool Accelerator_LocalStartStackDump(const char *dumpName, int &jobId, std::string &status, std::string &error)
+{
+	auto job = std::make_shared<LocalDumpJob>();
+	job->dumpName = dumpName ? dumpName : "";
+	job->stackOnly = true;
+	return EnqueueLocalDumpJob(job, jobId, status, error);
+}
+
+bool Accelerator_LocalGetJobStatus(int jobId,
+	std::string &state,
+	std::string &status,
+	std::string &outputPath,
+	std::string &error)
+{
+	std::lock_guard<std::mutex> lock(localDumpJobMutex);
+	auto it = localDumpJobs.find(jobId);
+	if (it == localDumpJobs.end()) {
+		error = "Job not found";
+		return false;
+	}
+
+	const LocalDumpJob &job = *it->second;
+	state = LocalDumpJobStateName(job.state);
+	status = job.state == LocalDumpJobState::Failed ? job.error : job.status;
+	outputPath = job.outputPath;
+	return true;
+}
+
+bool Accelerator_LocalGetJobResult(int jobId, std::string &result, std::string &error)
+{
+	std::lock_guard<std::mutex> lock(localDumpJobMutex);
+	auto it = localDumpJobs.find(jobId);
+	if (it == localDumpJobs.end()) {
+		error = "Job not found";
+		return false;
+	}
+
+	const LocalDumpJob &job = *it->second;
+	if (job.state == LocalDumpJobState::Queued || job.state == LocalDumpJobState::Running) {
+		error = "Job is not finished yet";
+		return false;
+	}
+	if (job.state == LocalDumpJobState::Failed) {
+		error = job.error.empty() ? "Job failed" : job.error;
+		return false;
+	}
+	if (job.stackOnly) {
+		result = job.result;
+	} else {
+		std::ostringstream out;
+		out << job.status;
+		result = out.str();
+	}
+	return true;
+}
+
+bool Accelerator_LocalGetConsoleDump(const char *dumpName, std::string &consoleDump, std::string &error)
+{
+	std::string dumpNameString = dumpName ? dumpName : "";
+	if (dumpNameString.empty()) {
+		error = "Dump name is empty";
+		return false;
+	}
+
+	PendingDumpEntry entry;
+	if (!FindPendingDumpByName(dumpNameString, entry, &error)) {
+		return false;
+	}
+	if (!entry.hasMetadata) {
+		error = "Dump metadata file was not found";
+		return false;
+	}
+
+	std::string metadata = ReadWholeFile(entry.metadataPath);
+	if (metadata.empty()) {
+		error = "Dump metadata file is empty";
+		return false;
+	}
+
+	consoleDump = ExtractConsoleHistorySection(metadata);
+	if (consoleDump.empty()) {
+		error = "Console history was not found in dump metadata";
+		return false;
+	}
+	return true;
+}
+
+void Accelerator_LocalTriggerCrashTest()
+{
+	AcceleratorConsoleWarning("Crash test command invoked. The server will now crash intentionally for Accelerator verification.");
+	fflush(stderr);
+
+#if defined _WINDOWS
+	RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+#else
+	volatile int *crash = nullptr;
+	*crash = 0xA11;
+#endif
+}
+
+struct UploadWatchdog
+{
+	std::atomic_bool done{false};
+	std::string stage;
+	std::string url;
+};
+
+static std::shared_ptr<UploadWatchdog> StartUploadWatchdog(const char *stage, const char *url)
+{
+	auto watchdog = std::make_shared<UploadWatchdog>();
+	watchdog->stage = stage ? stage : "upload";
+	watchdog->url = RedactUrlForLog(url);
+
+	std::thread([watchdog]() {
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		if (!watchdog->done.load()) {
+			AcceleratorConsoleWarning("%s did not finish within 5 seconds: %s", watchdog->stage.c_str(), watchdog->url.c_str());
+		}
+	}).detach();
+
+	return watchdog;
+}
+
+static void FinishUploadWatchdog(const std::shared_ptr<UploadWatchdog>& watchdog)
+{
+	if (watchdog) {
+		watchdog->done.store(true);
+	}
+}
 
 #if defined _LINUX
 void terminateHandler()
@@ -381,16 +3057,12 @@ public:
 
 class UploadThread: public IThread
 {
-	FILE *log = nullptr;
 	char serverId[38] = "";
 
 	void RunThread(IThreadHandle *pHandle) {
-		rootconsole->ConsolePrint("Accelerator upload thread started.");
-
-		log = fopen(logPath, "a");
-		if (!log) {
-			g_pSM->LogError(myself, "Failed to open Accelerator log file: %s", logPath);
-		}
+		const bool localMode = IsLocalMode();
+		AcceleratorDebugLog("Upload thread started. dump path: %s", dumpStoragePath);
+		AcceleratorDebugLog("Mode: %s", localMode ? "local" : "site");
 
 		char path[512];
 		g_pSM->Format(path, sizeof(path), "%s/server-id.txt", dumpStoragePath);
@@ -414,10 +3086,16 @@ class UploadThread: public IThread
 		}
 
 		IDirectory *dumps = libsys->OpenDirectory(dumpStoragePath);
+		if (!dumps) {
+			AcceleratorConsoleWarning("Failed to open dump directory: %s", dumpStoragePath);
+			g_accelerator.MarkAsDoneUploading();
+			return;
+		}
 
 		int skip = 0;
 		int count = 0;
 		int failed = 0;
+		int pending = 0;
 		char metapath[512];
 		char presubmitToken[512];
 		char response[512];
@@ -438,13 +3116,26 @@ class UploadThread: public IThread
 
 			g_pSM->Format(path, sizeof(path), "%s/%s", dumpStoragePath, name);
 			g_pSM->Format(metapath, sizeof(metapath), "%s.txt", path);
+			pending++;
+			AcceleratorDebugLog("Found pending crash dump: %s", path);
 
 			if (!libsys->PathExists(metapath)) {
 				metapath[0] = '\0';
+				AcceleratorConsoleWarning("Crash dump metadata file is missing for %s; proceeding without metadata", path);
+				AcceleratorDebugLog("Metadata file missing");
+			}
+
+			if (localMode) {
+				skip++;
+				AcceleratorDebugLog("Local mode: skipped remote upload for %s", path);
+				dumps->NextEntry();
+				continue;
 			}
 
 			presubmitToken[0] = '\0';
 			PresubmitResponse presubmitResponse = kPRUploadCrashDumpAndMetadata;
+			bool deleteAfterProcessing = false;
+			const bool shouldDeleteProcessedDump = ShouldDeleteProcessedDump();
 
 			const char *presubmitOption = g_pSM->GetCoreConfigValue("MinidumpPresubmit");
 			bool canPresubmit = !presubmitOption || (tolower(presubmitOption[0]) == 'y' || presubmitOption[0] == '1');
@@ -456,61 +3147,65 @@ class UploadThread: public IThread
 			switch (presubmitResponse) {
 				case kPRLocalError:
 					failed++;
-					g_pSM->LogError(myself, "Accelerator failed to locally process crash dump");
-					if (log) fprintf(log, "Failed to locally process crash dump");
+					AcceleratorConsoleWarning("Failed to locally process crash dump before upload.");
 					break;
 				case kPRRemoteError:
 				case kPRUploadCrashDumpAndMetadata:
 				case kPRUploadMetadataOnly:
 					if (UploadCrashDump((presubmitResponse == kPRUploadMetadataOnly) ? nullptr : path, metapath, presubmitToken, response, sizeof(response))) {
 						count++;
-						g_pSM->LogError(myself, "Accelerator uploaded crash dump: %s", response);
-						if (log) fprintf(log, "Uploaded crash dump: %s\n", response);
+						deleteAfterProcessing = shouldDeleteProcessedDump;
+						AcceleratorConsoleWarning("Uploaded crash dump: %s", response);
 						UploadedCrash crash{ response };
 						g_accelerator.StoreUploadedCrash(crash);
 					} else {
 						failed++;
-						g_pSM->LogError(myself, "Accelerator failed to upload crash dump: %s", response);
-						if (log) fprintf(log, "Failed to upload crash dump: %s\n", response);
+						AcceleratorConsoleWarning("Failed to upload crash dump: %s", response);
 					}
 					break;
 				case kPRDontUpload:
 					skip++;
-					g_pSM->LogError(myself, "Accelerator crash dump upload skipped by server");
-					if (log) fprintf(log, "Skipped due to server request\n");
+					deleteAfterProcessing = shouldDeleteProcessedDump;
+					AcceleratorConsoleWarning("Crash dump upload skipped by server policy.");
 					break;
 			}
 
-			if (metapath[0]) {
-				unlink(metapath);
+			if (deleteAfterProcessing) {
+				if (metapath[0]) {
+					unlink(metapath);
+				}
+
+				unlink(path);
+			} else {
+				const char *keepReason = shouldDeleteProcessedDump
+					? "retry"
+					: "MinidumpDeleteAfterProcessing is disabled";
+				AcceleratorConsoleWarning("Keeping crash dump (%s): %s", keepReason, path);
 			}
-
-			unlink(path);
-
-			if (log) fflush(log);
 
 			dumps->NextEntry();
 		}
 
 		libsys->CloseDirectory(dumps);
-
-		if (log) {
-			fclose(log);
-			log = nullptr;
+		if (pending == 0) {
+			AcceleratorDebugLog("No pending crash dumps found.");
 		}
 
 		g_accelerator.MarkAsDoneUploading();
-		rootconsole->ConsolePrint("Accelerator upload thread finished. (%d skipped, %d uploaded, %d failed)", skip, count, failed);
+		if (skip == 0 && count == 0 && failed == 0) {
+			AcceleratorConsoleMessage("Upload thread finished. (%d skipped, %d uploaded, %d failed)", skip, count, failed);
+		} else {
+			AcceleratorConsoleWarning("Upload thread finished. (%d skipped, %d uploaded, %d failed)", skip, count, failed);
+		}
 	}
 
 	void OnTerminate(IThreadHandle *pHandle, bool cancel) {
-		rootconsole->ConsolePrint("Accelerator upload thread terminated. (canceled = %s)", (cancel ? "true" : "false"));
+		AcceleratorDebugLog("Upload thread terminated. (canceled = %s)", (cancel ? "true" : "false"));
 	}
 
 #if defined _LINUX
 	bool UploadSymbolFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
-		if (log) fprintf(log, "UploadSymbolFile\n");
-		if (log) fflush(log);
+		AcceleratorDebugLog("UploadSymbolFile");
 
 		auto debugFile = module->debug_file();
 		std::string vdsoOutputPath = "";
@@ -555,12 +3250,11 @@ class UploadThread: public IThread
 			}
 		}
 
-		if (debugFile[0] != '/') {
+		if (!IsAbsolutePath(debugFile)) {
 			return false;
 		}
 
-		if (log) fprintf(log, "Submitting symbols for %s\n", debugFile.c_str());
-		if (log) fflush(log);
+		AcceleratorDebugLog("Submitting symbols for %s", debugFile.c_str());
 
 		auto debugFileDir = google_breakpad::DirName(debugFile);
 		std::vector<std::string> debug_dirs{
@@ -581,8 +3275,7 @@ class UploadThread: public IThread
 
 				// Try again without debug dirs.
 				if (!WriteSymbolFile(debugFile, debugFile, "Linux", "", {}, options, outputStream)) {
-					if (log) fprintf(log, "Failed to process symbol file\n");
-					if (log) fflush(log);
+					AcceleratorDebugLog("Failed to process symbol file");
 					return false;
 				}
 			}
@@ -617,11 +3310,14 @@ class UploadThread: public IThread
 		const char *symbolUrl = g_pSM->GetCoreConfigValue("MinidumpSymbolUrl");
 		if (!symbolUrl) symbolUrl = "http://crash.limetech.org/symbols/submit";
 
+		auto watchdog = StartUploadWatchdog("symbol upload", symbolUrl);
 		bool symbolUploaded = xfer->PostAndDownload(symbolUrl, form, &data, NULL);
+		FinishUploadWatchdog(watchdog);
 
 		if (!symbolUploaded) {
-			if (log) fprintf(log, "Symbol upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fflush(log);
+			AcceleratorConsoleWarning("Symbol upload failed for %s via %s: %s (%d)",
+				debugFile.c_str(), RedactUrlForLog(symbolUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
+			AcceleratorDebugLog("Symbol upload failed: %s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return false;
 		}
 
@@ -632,9 +3328,8 @@ class UploadThread: public IThread
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
-		if (log) fprintf(log, "Symbol upload complete: %s\n", response);
+		AcceleratorDebugLog("Symbol upload complete: %s", response);
 		delete[] response;
-		if (log) fflush(log);
 		return true;
 	}
 #endif
@@ -642,16 +3337,11 @@ class UploadThread: public IThread
 	bool UploadModuleFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
 		const auto &codeFile = module->code_file();
 
-#ifndef WIN32
-		if (codeFile[0] != '/') {
-#else
-		if (codeFile[1] != ':') {
-#endif
+		if (!IsAbsolutePath(codeFile)) {
 			return false;
 		}
 
-		if (log) fprintf(log, "Submitting binary for %s\n", codeFile.c_str());
-		if (log) fflush(log);
+		AcceleratorDebugLog("Submitting binary for %s", codeFile.c_str());
 
 		IWebForm *form = webternet->CreateForm();
 
@@ -677,11 +3367,14 @@ class UploadThread: public IThread
 		const char *binaryUrl = g_pSM->GetCoreConfigValue("MinidumpBinaryUrl");
 		if (!binaryUrl) binaryUrl = "http://crash.limetech.org/binary/submit";
 
+		auto watchdog = StartUploadWatchdog("binary upload", binaryUrl);
 		bool binaryUploaded = xfer->PostAndDownload(binaryUrl, form, &data, NULL);
+		FinishUploadWatchdog(watchdog);
 
 		if (!binaryUploaded) {
-			if (log) fprintf(log, "Binary upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fflush(log);
+			AcceleratorConsoleWarning("Binary upload failed for %s via %s: %s (%d)",
+				codeFile.c_str(), RedactUrlForLog(binaryUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
+			AcceleratorDebugLog("Binary upload failed: %s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return false;
 		}
 
@@ -692,8 +3385,7 @@ class UploadThread: public IThread
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
-		if (log) fprintf(log, "Binary upload complete: %s\n", response);
-		if (log) fflush(log);
+		AcceleratorDebugLog("Binary upload complete: %s", response);
 		delete[] response;
 
 		return true;
@@ -768,15 +3460,11 @@ class UploadThread: public IThread
 
 		const auto &codeFile = module->code_file();
 
-#ifndef WIN32
 		if (codeFile == "linux-gate.so") {
 			return kMTSystem;
 		}
 
-		if (codeFile[0] != '/') {
-#else
-		if (codeFile[1] != ':') {
-#endif
+		if (!IsAbsolutePath(codeFile)) {
 			return kMTUnknown;
 		}
 
@@ -822,6 +3510,7 @@ class UploadThread: public IThread
 		}
 
 		if (processResult != google_breakpad::PROCESS_OK) {
+			AcceleratorConsoleWarning("Presubmit failed locally: minidump processor returned %d", processResult);
 			return kPRLocalError;
 		}
 
@@ -842,6 +3531,7 @@ class UploadThread: public IThread
 
 		const google_breakpad::CallStack *stack = processState.threads()->at(requestingThread);
 		if (!stack) {
+			AcceleratorConsoleWarning("Presubmit failed locally: crashed thread stack was not available");
 			return kPRLocalError;
 		}
 
@@ -899,10 +3589,14 @@ class UploadThread: public IThread
 		const char *minidumpUrl = g_pSM->GetCoreConfigValue("MinidumpUrl");
 		if (!minidumpUrl) minidumpUrl = "http://crash.limetech.org/submit";
 
+		auto watchdog = StartUploadWatchdog("presubmit", minidumpUrl);
 		bool uploaded = xfer->PostAndDownload(minidumpUrl, form, &data, NULL);
+		FinishUploadWatchdog(watchdog);
 
 		if (!uploaded) {
-			if (log) fprintf(log, "Presubmit failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
+			AcceleratorConsoleWarning("Presubmit failed via %s: %s (%d)",
+				RedactUrlForLog(minidumpUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
+			AcceleratorDebugLog("Presubmit failed: %s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return kPRRemoteError;
 		}
 
@@ -916,13 +3610,15 @@ class UploadThread: public IThread
 		//if (log) fprintf(log, "Presubmit complete: %s\n", response);
 
 		if (responseSize < 2) {
-			if (log) fprintf(log, "Presubmit response too short\n");
+			AcceleratorConsoleWarning("Presubmit failed: server response was too short from %s", RedactUrlForLog(minidumpUrl).c_str());
+			AcceleratorDebugLog("Presubmit response too short");
 			delete[] response;
 			return kPRRemoteError;
 		}
 
 		if (response[0] == 'E') {
-			if (log) fprintf(log, "Presubmit error: %s\n", &response[2]);
+			AcceleratorConsoleWarning("Presubmit rejected by server %s: %s", RedactUrlForLog(minidumpUrl).c_str(), &response[2]);
+			AcceleratorDebugLog("Presubmit error: %s", &response[2]);
 			delete[] response;
 			return kPRRemoteError;
 		}
@@ -934,14 +3630,16 @@ class UploadThread: public IThread
 		else return kPRRemoteError;
 
 		if (response[1] != '|') {
-			if (log) fprintf(log, "Response delimiter missing\n");
+			AcceleratorConsoleWarning("Presubmit failed: server response delimiter missing from %s", RedactUrlForLog(minidumpUrl).c_str());
+			AcceleratorDebugLog("Response delimiter missing");
 			delete[] response;
 			return kPRRemoteError;
 		}
 
 		unsigned int responseCount = responseSize - 2;
 		if (responseCount < moduleCount) {
-			if (log) fprintf(log, "Response module list doesn't match sent list (%d < %d)\n", responseCount, moduleCount);
+			AcceleratorConsoleWarning("Presubmit warning: server module response was shorter than request (%u < %u)", responseCount, moduleCount);
+			AcceleratorDebugLog("Response module list doesn't match sent list (%u < %u)", responseCount, moduleCount);
 			delete[] response;
 			return presubmitResponse;
 		}
@@ -960,7 +3658,7 @@ class UploadThread: public IThread
 				tokenBuffer[tokenLength] = '\0';
 			}
 
-			if (log) fprintf(log, "Got a presubmit token from server: %s\n", tokenBuffer);
+			AcceleratorDebugLog("Got a presubmit token from server: %s", tokenBuffer);
 		}
 
 		if (moduleCount > 0) {
@@ -989,14 +3687,12 @@ class UploadThread: public IThread
 				if (!submitSymbols && !submitBinary) {
 					continue;
 				}
-				if (log) fprintf(log, "Getting module at index %d\n", moduleIndex);
-				if (log) fflush(log);
+				AcceleratorDebugLog("Getting module at index %d", moduleIndex);
 
 				auto module = processState.modules()->GetModuleAtIndex(moduleIndex);
 
 				auto moduleType = ClassifyModule(module);
-				if (log) fprintf(log, "Classified module %s as %s\n", module->code_file().c_str(), ModuleTypeCode[moduleType]);
-				if (log) fflush(log);
+				AcceleratorDebugLog("Classified module %s as %s", module->code_file().c_str(), ModuleTypeCode[moduleType]);
 				switch (moduleType) {
 					case kMTUnknown:
 						continue;
@@ -1029,8 +3725,7 @@ class UploadThread: public IThread
 #endif
 			}
 		}
-		if (log) fprintf(log, "PresubmitCrashDump complete\n");
-		if (log) fflush(log);
+		AcceleratorDebugLog("PresubmitCrashDump complete");
 
 		delete[] response;
 		return presubmitResponse;
@@ -1065,7 +3760,9 @@ class UploadThread: public IThread
 		const char *minidumpUrl = g_pSM->GetCoreConfigValue("MinidumpUrl");
 		if (!minidumpUrl) minidumpUrl = "http://crash.limetech.org/submit";
 
+		auto watchdog = StartUploadWatchdog("crash dump upload", minidumpUrl);
 		bool uploaded = xfer->PostAndDownload(minidumpUrl, form, &data, NULL);
+		FinishUploadWatchdog(watchdog);
 
 		if (response) {
 			if (uploaded) {
@@ -1081,6 +3778,11 @@ class UploadThread: public IThread
 			}
 		}
 
+		if (!uploaded) {
+			AcceleratorConsoleWarning("Crash dump upload failed via %s: %s (%d)",
+				RedactUrlForLog(minidumpUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
+		}
+
 		return uploaded;
 	}
 } uploadThread;
@@ -1093,9 +3795,9 @@ public:
 		for (;;) {
 			// Wait until OnMapStart is called once, this should be enough delay to make sure plugins are loaded.
 			if (g_accelerator.IsMapStarted() && g_accelerator.IsDoneUploading()) {
-				extforwards::CallOnDoneUploadingForward();
 				break;
 			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
 	}
 
@@ -1104,10 +3806,67 @@ public:
 
 } spNotifyThread;
 
+static void StartAcceleratorBackgroundThreads()
+{
+	if (acceleratorBackgroundThreadsStarted.exchange(true, std::memory_order_relaxed)) {
+		return;
+	}
+
+	const bool localMode = IsLocalMode();
+	if (!localMode) {
+		threader->MakeThread(&uploadThread);
+	} else {
+		g_accelerator.MarkAsDoneUploading();
+		StartLocalDumpWorker();
+	}
+
+	// This thread waits for Accelerator to finish uploading and for the first OnMapStart call,
+	// then fires a SourceMod forward.
+	threader->MakeThread(&spNotifyThread);
+}
+
 class VFuncEmptyClass {};
+
+static const char *GetProcessCommandLine()
+{
+	static char cmdline[1024] = {0};
+	if (cmdline[0]) {
+		return cmdline;
+	}
+
+#if defined _LINUX
+	FILE *fp = fopen("/proc/self/cmdline", "rb");
+	if (!fp) {
+		return "";
+	}
+
+	size_t bytes = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+	fclose(fp);
+
+	for (size_t i = 0; i < bytes; ++i) {
+		if (cmdline[i] == '\0') {
+			cmdline[i] = ' ';
+		}
+	}
+	cmdline[bytes] = '\0';
+#elif defined _WINDOWS
+	const char *raw = GetCommandLineA();
+	if (!raw || !raw[0]) {
+		return "";
+	}
+	strncpy(cmdline, raw, sizeof(cmdline) - 1);
+#else
+	return "";
+#endif
+
+	return cmdline;
+}
 
 const char *GetCmdLine()
 {
+#if !defined SMEXT_ENABLE_GAMEHELPERS
+	return GetProcessCommandLine();
+#else
 	static int getCmdLineOffset = 0;
 	if (getCmdLineOffset == 0) {
 		if (!gameconfig || !gameconfig->GetOffset("GetCmdLine", &getCmdLineOffset)) {
@@ -1118,7 +3877,13 @@ const char *GetCmdLine()
 		}
 	}
 
-	void *cmdline = gamehelpers->GetValveCommandLine();
+	void *cmdline = nullptr;
+#if defined SMEXT_ENABLE_GAMEHELPERS
+	cmdline = gamehelpers->GetValveCommandLine();
+#endif
+	if (!cmdline) {
+		return GetProcessCommandLine();
+	}
 	void **vtable = *(void ***)cmdline;
 	void *vfunc = vtable[getCmdLineOffset];
 
@@ -1139,6 +3904,7 @@ const char *GetCmdLine()
 #endif
 
 	return (const char *)(reinterpret_cast<VFuncEmptyClass*>(cmdline)->*u.mfpnew)();
+#endif
 }
 
 Accelerator::Accelerator() :
@@ -1148,8 +3914,14 @@ Accelerator::Accelerator() :
 
 bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 {
-	sharesys->AddDependency(myself, "webternet.ext", true, true);
-	SM_GET_IFACE(WEBTERNET, webternet);
+	acceleratorDebugLoggingEnabled.store(IsTruthyCoreConfigValue("MinidumpDebug", false), std::memory_order_relaxed);
+	const bool localMode = IsLocalMode();
+	if (!localMode) {
+		sharesys->AddDependency(myself, "webternet.ext", true, true);
+		SM_GET_IFACE(WEBTERNET, webternet);
+	} else {
+		webternet = nullptr;
+	}
 
 	g_pSM->BuildPath(Path_SM, dumpStoragePath, sizeof(dumpStoragePath), "data/dumps");
 
@@ -1165,13 +3937,31 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 	g_pSM->BuildPath(Path_SM, logPath, sizeof(logPath), "logs/accelerator.log");
 
-	// Get these early so the upload thread can use them.
+	// Get these early so path resolution and background workers can use them safely.
 	strncpy(crashGamePath, g_pSM->GetGamePath(), sizeof(crashGamePath) - 1);
 	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
 	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
 
-	threader->MakeThread(&uploadThread);
-	threader->MakeThread(&spNotifyThread); // This thread waits for accelator to be done uploading and for the first OnMapStart call, then fires a SourceMod forward
+	AcceleratorConsoleMessage("Accelerator mode: %s", localMode ? "local" : "site");
+	AcceleratorDebugLog("Accelerator mode: %s", localMode ? "local" : "site");
+	if (localMode) {
+		const std::string carburetorPath = GetConfiguredCarburetorPath();
+		const std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
+		const std::string joinedSymbolPaths = symbolPaths.empty() ? "(none)" : JoinStrings(symbolPaths, "; ");
+		std::string createError;
+		if (!EnsureDirectoryExists(GetLocalSymbolStoreRoot(), createError) && !createError.empty()) {
+			AcceleratorConsoleWarning("Failed to create local symbol store root: %s", createError.c_str());
+		}
+		createError.clear();
+		if (!EnsureDirectoryExists(GetLocalOutputRoot(), createError) && !createError.empty()) {
+			AcceleratorConsoleWarning("Failed to create local output root: %s", createError.c_str());
+		}
+		AcceleratorDebugLog("Local mode carburetor path: %s", carburetorPath.c_str());
+		AcceleratorDebugLog("Local mode symbol paths: %s", joinedSymbolPaths.c_str());
+		if (!PathExistsFile(carburetorPath)) {
+			AcceleratorConsoleWarning("Carburetor binary is missing. rawraw will fall back to built-in output until MinidumpLocalCarburetorPath is configured.");
+		}
+	}
 
 	do {
 		char gameconfigError[256];
@@ -1234,6 +4024,10 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 #error Bad platform.
 #endif
 
+	#if SMINTERFACE_EXTENSIONAPI_VERSION >= 9
+	strncpy(crashSourceModVersion, SM_FULL_VERSION, sizeof(crashSourceModVersion) - 1);
+	crashSourceModVersion[sizeof(crashSourceModVersion) - 1] = '\0';
+	#else
 	do {
 		char spJitPath[512];
 		g_pSM->BuildPath(Path_SM, spJitPath, sizeof(spJitPath), "bin/" PLATFORM_ARCH_FOLDER "sourcepawn.jit.x86." PLATFORM_LIB_EXT);
@@ -1271,6 +4065,7 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 		strncpy(crashSourceModVersion, spEngine2->GetVersionString(), sizeof(crashSourceModVersion));
 	} while(false);
+	#endif
 
 	plsys->AddPluginsListener(this);
 
@@ -1353,6 +4148,9 @@ void Accelerator::SDK_OnUnload()
 {
 	extforwards::Shutdown();
 	plsys->RemovePluginsListener(this);
+	if (IsLocalMode()) {
+		StopLocalDumpWorker();
+	}
 
 #if defined _LINUX
 	g_pSM->RemoveGameFrameHook(OnGameFrame);
@@ -1369,6 +4167,7 @@ void Accelerator::SDK_OnUnload()
 
 void Accelerator::SDK_OnAllLoaded()
 {
+	acceleratorDebugLoggingEnabled.store(IsTruthyCoreConfigValue("MinidumpDebug", false), std::memory_order_relaxed);
 	extforwards::Init();
 	sharesys->RegisterLibrary(myself, "accelerator");
 
@@ -1376,11 +4175,12 @@ void Accelerator::SDK_OnAllLoaded()
 	m_natives.push_back({ nullptr, nullptr }); // SM requires this to signal the end of the native info array
 
 	sharesys->AddNatives(myself, m_natives.data());
+	StartAcceleratorBackgroundThreads();
 }
 
 void Accelerator::OnCoreMapStart(edict_t *pEdictList, int edictCount, int clientMax)
 {
-	strncpy(crashMap, gamehelpers->GetCurrentMap(), sizeof(crashMap) - 1);
+	crashMap[0] = '\0';
 	m_maphasstarted.store(true);
 }
 
@@ -1484,16 +4284,21 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 	size += sizeof(void *); // GetBaseContext
 	size += filenameSize;
 
-	uint32_t count = runtime->GetPublicsNum();
+	uint32_t count = 0;
+#if SMINTERFACE_EXTENSIONAPI_VERSION < 9
+	count = runtime->GetPublicsNum();
+#endif
 	size += sizeof(uint32_t); // count
 	size += count * sizeof(uint32_t); // pubinfo->code_offs
 
+#if SMINTERFACE_EXTENSIONAPI_VERSION < 9
 	for (uint32_t i = 0; i < count; ++i) {
 		sp_public_t *pubinfo;
 		runtime->GetPublicByIndex(i, &pubinfo);
 
 		size += strlen(pubinfo->name) + 1;
 	}
+#endif
 
 	unsigned char *buffer = (unsigned char *)malloc(size);
 	unsigned char *cursor = buffer;
@@ -1510,6 +4315,7 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 	memcpy(cursor, &count, sizeof(uint32_t));
 	cursor += sizeof(uint32_t);
 
+#if SMINTERFACE_EXTENSIONAPI_VERSION < 9
 	for (uint32_t i = 0; i < count; ++i) {
 		sp_public_t *pubinfo;
 		runtime->GetPublicByIndex(i, &pubinfo);
@@ -1521,6 +4327,7 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 		memcpy(cursor, pubinfo->name, nameSize);
 		cursor += nameSize;
 	}
+#endif
 
 	pluginContextMap[context] = buffer;
 

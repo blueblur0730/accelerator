@@ -13,14 +13,18 @@
 
 #ifndef SM_GENERATED_BUILD
 #undef BINARY_NAME
+#if defined _WIN32
 #define BINARY_NAME "accelerator.ext.dll\0"
+#else
+#define BINARY_NAME "accelerator.ext.so\0"
+#endif
 #endif
 
 #define SM_BUILD_TAG		"-manual"
 #define SM_BUILD_UNIQUEID	"[MANUAL BUILD]"
-#define SM_VERSION			"2.6.0"
+#define SM_VERSION			"2.7.1"
 #define SM_FULL_VERSION		SM_VERSION SM_BUILD_TAG
-#define SM_FILE_VERSION		2,6,0,0
+#define SM_FILE_VERSION		2,7,1,0
 
 #endif
 
